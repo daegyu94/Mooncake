@@ -61,3 +61,49 @@ def test_failed_extent_is_not_published():
         store.put(0, ["a"], [Buffer(128, "cpu")])
     assert not store.index
     assert len(store.extents) == 1
+
+
+def test_fence_waits_for_inflight_restore_before_reclaim():
+    client = MagicMock()
+    client.batch_put_from_multi_buffers.return_value = [0]
+    client.register_buffer.return_value = 0
+    client.batch_remove.return_value = [0]
+    entered, release, switching = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def restore(keys, pointers, sizes):
+        import ctypes
+
+        entered.set()
+        assert release.wait(5)
+        ctypes.memset(pointers[0][0], 37, sizes[0][0])
+        return [sizes[0][0]]
+
+    client.batch_get_into_multi_buffers.side_effect = restore
+    store = PolicyExtentStore(client, None, "owned", 2)
+    source = [Buffer(128, "cpu"), Buffer(128, "cpu")]
+    destination = Buffer(128, "cpu")
+    store.put(0, ["a", "b"], source)
+
+    def advance():
+        switching.set()
+        return store.advance_policy(1)
+
+    with ThreadPoolExecutor(2) as pool:
+        reader = pool.submit(store.get, 0, ["b"], [destination])
+        assert entered.wait(5)
+        fence = pool.submit(advance)
+        assert switching.wait(5)
+        assert not fence.done()
+        client.batch_remove.assert_not_called()
+        release.set()
+        reader.result(timeout=5)
+        fence.result(timeout=5)
+    import ctypes
+
+    assert ctypes.string_at(destination.address, 128) == bytes([37]) * 128
+    assert store.epoch == 1 and not store.index
+    store.close()
