@@ -1,0 +1,10 @@
+{
+  "runs": 6,
+  "same_keys": true,
+  "changed_payload_epochs": 4,
+  "keys_per_epoch": 16,
+  "checked_roundtrips": 384,
+  "stale_hits": 0,
+  "trace_bytes_match": true,
+  "device": "cuda:0 on physical GPU1"
+}
