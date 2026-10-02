@@ -34,6 +34,7 @@ def main():
     if min(a.keys, a.epochs, a.extent_blocks, a.block_bytes, a.read_stride) < 1:
         p.error("sizes must be positive")
     a.output.mkdir(parents=True, exist_ok=False)
+    (a.output / "offload").mkdir()
     client = MooncakeDistributedStore()
     rc = client.setup(
         "127.0.0.1:53301",
