@@ -67,3 +67,13 @@ Neither fio nor this CPU benchmark demonstrates an end-to-end Agent RL speedup o
 The client and its FD cache persist across policy epochs, matching the worker lifecycle.
 Only the explicitly allocated memory segment is unmounted to force DFS restoration, after all submitted operations complete.
 CUDA fixtures synchronize before submission and after native completion; CPU checksums are outside individual I/O phase timings.
+
+The client's `--local-buffer-bytes` supplies temporary contiguous storage for
+DFS multi-buffer reads and is distinct from FileStorage's offload RPC arena
+(`MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`).
+A 4 MiB payload with four keys per batch and four concurrent batches can need
+64 MiB of restore buffers: the initial 16 MiB fixture fails with error `-200`.
+Use `--local-buffer-bytes 134217728` for those scenarios, keep it equal between
+allocator variants and repetitions, and disclose the larger buffer capacity.
+The raw `staging_pool_bytes` summary field records the offload RPC arena setting,
+not the independent GPU D2H pinned-buffer pool.

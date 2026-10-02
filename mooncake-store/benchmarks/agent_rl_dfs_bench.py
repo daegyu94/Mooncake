@@ -74,6 +74,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--slices", type=int, default=56)
+    parser.add_argument("--local-buffer-bytes", type=int, default=16 * 1024 * 1024)
     parser.add_argument("--segment-bytes", type=int, default=268435456)
     args = parser.parse_args()
     if not args.dedicated_master_confirmed:
@@ -119,7 +120,7 @@ def main():
             f"127.0.0.1:{port}",
             "P2PHANDSHAKE",
             0,
-            16 * 1024 * 1024,
+            args.local_buffer_bytes,
             "tcp",
             "",
             args.master,
