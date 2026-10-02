@@ -24,6 +24,7 @@ def main():
     p.add_argument("--keys", type=int, default=32)
     p.add_argument("--epochs", type=int, default=4)
     p.add_argument("--read-stride", type=int, default=1)
+    p.add_argument("--restore-repeats", type=int, default=1)
     p.add_argument("--device", default="cuda:0")
     a = p.parse_args()
     if (
@@ -31,7 +32,17 @@ def main():
         or os.environ.get("MOONCAKE_DFS_FS_ADAPTER") != "hf3fs"
     ):
         p.error("requires a dedicated real hf3fs master")
-    if min(a.keys, a.epochs, a.extent_blocks, a.block_bytes, a.read_stride) < 1:
+    if (
+        min(
+            a.keys,
+            a.epochs,
+            a.extent_blocks,
+            a.block_bytes,
+            a.read_stride,
+            a.restore_repeats,
+        )
+        < 1
+    ):
         p.error("sizes must be positive")
     a.output.mkdir(parents=True, exist_ok=False)
     (a.output / "offload").mkdir()
@@ -102,15 +113,18 @@ def main():
                 for d in client.get_replica_desc(key)
             )
             before = store.read_bytes
-            timed(
-                "dfs_get",
-                lambda: store.get(
-                    epoch, [keys[i] for i in selected], [buffers[i] for i in selected]
-                ),
-                logical_bytes=len(selected) * a.block_bytes,
-            )
-            for i in selected:
-                assert hashlib.sha256(buffers[i].raw()).hexdigest() == expected[i]
+            for _ in range(a.restore_repeats):
+                timed(
+                    "dfs_get",
+                    lambda: store.get(
+                        epoch,
+                        [keys[i] for i in selected],
+                        [buffers[i] for i in selected],
+                    ),
+                    logical_bytes=len(selected) * a.block_bytes,
+                )
+                for i in selected:
+                    assert hashlib.sha256(buffers[i].raw()).hexdigest() == expected[i]
             transferred = store.read_bytes - before
             retired = timed(
                 "reset", lambda: store.advance_policy(epoch + 1), objects=len(live)
@@ -127,7 +141,9 @@ def main():
                     epoch=epoch,
                     physical_objects=len(live),
                     stale_hits=0,
-                    logical_read_bytes=len(selected) * a.block_bytes,
+                    logical_read_bytes=len(selected)
+                    * a.block_bytes
+                    * a.restore_repeats,
                     dfs_read_bytes=transferred,
                     checksums=expected,
                 )
@@ -141,7 +157,10 @@ def main():
         module_path=__import__("mooncake.store", fromlist=["store"]).__file__,
         implementation=str(Path(__file__).resolve()),
         logical_put_bytes=a.epochs * a.keys * a.block_bytes,
-        logical_dfs_read_bytes=a.epochs * len(selected) * a.block_bytes,
+        logical_dfs_read_bytes=a.epochs
+        * len(selected)
+        * a.block_bytes
+        * a.restore_repeats,
         wall_ns=time.perf_counter_ns() - wall_start,
         process_cpu_ns=time.process_time_ns() - cpu_start,
         peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
