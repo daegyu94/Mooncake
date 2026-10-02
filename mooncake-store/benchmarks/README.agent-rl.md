@@ -2,7 +2,8 @@
 
 `agent_rl_dfs_bench.py` uses the real native Store API and the `hf3fs` adapter with deterministic CPU buffers.
 It covers same-policy existence checks and memory-tier reuse, explicit memory segment removal, DFS-only restoration with SHA-256 checks, and drained policy invalidation.
-It is a synthetic lifecycle benchmark, and does not measure GPU staging, veRL scheduling, or total rollout performance.
+The default CPU fixture does not measure GPU staging, veRL scheduling, or total rollout performance.
+Use `--device cuda:0` with an appropriate PyTorch installation to validate GPU staging and byte correctness separately; this still is a synthetic workload.
 
 ## Run
 
@@ -62,3 +63,7 @@ Size the experimental 64 MiB staging pool for the live in-flight workload before
 Use fio's official USRBIO engine to isolate overwrite geometry with the same chunk size and request bytes.
 It omits Store metadata, allocator placement, duplicate suppression, staging copies and invalidation.
 Neither fio nor this CPU benchmark demonstrates an end-to-end Agent RL speedup or NAND write amplification.
+
+The client and its FD cache persist across policy epochs, matching the worker lifecycle.
+Only the explicitly allocated memory segment is unmounted to force DFS restoration, after all submitted operations complete.
+CUDA fixtures synchronize before submission and after native completion; CPU checksums are outside individual I/O phase timings.

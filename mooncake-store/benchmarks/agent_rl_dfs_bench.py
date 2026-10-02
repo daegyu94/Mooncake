@@ -20,9 +20,52 @@ from pathlib import Path
 from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 
+class Buffer:
+    """Address-stable CPU or optional CUDA fixture, with checks outside I/O timing."""
+
+    def __init__(self, size, device):
+        self.size = size
+        self.torch = None
+        if device == "cpu":
+            self.data = ctypes.create_string_buffer(size)
+            self.address = ctypes.addressof(self.data)
+        else:
+            import torch
+
+            self.torch = torch
+            self.data = torch.empty(size, dtype=torch.uint8, device=device)
+            self.address = self.data.data_ptr()
+
+    def fill(self, payload):
+        if self.torch is None:
+            ctypes.memmove(self.address, payload, self.size)
+        else:
+            self.data.copy_(
+                self.torch.frombuffer(bytearray(payload), dtype=self.torch.uint8)
+            )
+
+    def clear(self):
+        if self.torch is None:
+            ctypes.memset(self.address, 0, self.size)
+        else:
+            self.data.zero_()
+
+    def raw(self):
+        return (
+            self.data.raw if self.torch is None else self.data.cpu().numpy().tobytes()
+        )
+
+    def synchronize(self):
+        if self.torch is not None:
+            self.torch.cuda.synchronize(self.data.device)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--master", required=True)
+    parser.add_argument(
+        "--device", default="cpu", help="cpu or an optional CUDA device such as cuda:0"
+    )
     parser.add_argument("--dedicated-master-confirmed", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--payload-bytes", type=int, default=458752)
@@ -57,15 +100,11 @@ def main():
     args.output.mkdir(parents=True)
     (args.output / "local-offload").mkdir()
     events = []
-    buffers = [
-        ctypes.create_string_buffer(args.payload_bytes) for _ in range(args.keys)
-    ]
+    buffers = [Buffer(args.payload_bytes, args.device) for _ in range(args.keys)]
     base, remainder = divmod(args.payload_bytes, args.slices)
     sizes = [base + (index < remainder) for index in range(args.slices)]
     starts = [sum(sizes[:index]) for index in range(args.slices)]
-    pointers = [
-        [ctypes.addressof(buffer) + offset for offset in starts] for buffer in buffers
-    ]
+    pointers = [[buffer.address + offset for offset in starts] for buffer in buffers]
     all_sizes = [sizes for _ in buffers]
     replica = ReplicateConfig()
     replica.replica_num = 1
@@ -90,7 +129,7 @@ def main():
         if rc != 0:
             raise RuntimeError(f"setup failed: {rc}")
         for buffer in buffers:
-            rc = client.register_buffer(ctypes.addressof(buffer), args.payload_bytes)
+            rc = client.register_buffer(buffer.address, args.payload_bytes)
             if rc != 0:
                 raise RuntimeError(f"register_buffer failed: {rc}")
         return client
@@ -111,20 +150,25 @@ def main():
         return result
 
     def batches(client, operation, keys):
+        buffers[0].synchronize()
+
         def batch(start):
             stop = min(start + args.batch_size, len(keys))
 
             def fn():
                 if operation == "put":
-                    return client.batch_put_from_multi_buffers(
+                    result = client.batch_put_from_multi_buffers(
                         keys[start:stop],
                         pointers[start:stop],
                         all_sizes[start:stop],
                         replica,
                     )
-                return client.batch_get_into_multi_buffers(
-                    keys[start:stop], pointers[start:stop], all_sizes[start:stop]
-                )
+                else:
+                    result = client.batch_get_into_multi_buffers(
+                        keys[start:stop], pointers[start:stop], all_sizes[start:stop]
+                    )
+                buffers[0].synchronize()
+                return result
 
             results = timed(
                 operation,
@@ -151,25 +195,26 @@ def main():
         )
 
     def checksum():
-        return [hashlib.sha256(buffer.raw).hexdigest() for buffer in buffers]
+        return [hashlib.sha256(buffer.raw()).hexdigest() for buffer in buffers]
 
     cpu_start = time.process_time_ns()
     wall_start = time.perf_counter_ns()
     lifecycle = []
-    for epoch in range(args.epochs):
-        keys = [f"agent-rl-policy-{epoch}-prefix-{i}" for i in range(args.keys)]
-        for i, buffer in enumerate(buffers):
-            seed = hashlib.sha256(f"policy={epoch},prefix={i}".encode()).digest()
-            payload = (seed * ((args.payload_bytes + 31) // 32))[: args.payload_bytes]
-            ctypes.memmove(buffer, payload, args.payload_bytes)
-        expected = checksum()
-        producer = setup()
-        mounted = producer.allocate_and_mount_segment(args.segment_bytes)
-        if mounted["ret"] != 0:
-            raise RuntimeError(f"Segment allocation failed: {mounted}")
-        try:
+    producer = setup()
+    try:
+        for epoch in range(args.epochs):
+            keys = [f"agent-rl-policy-{epoch}-prefix-{i}" for i in range(args.keys)]
+            for i, buffer in enumerate(buffers):
+                seed = hashlib.sha256(f"policy={epoch},prefix={i}".encode()).digest()
+                payload = (seed * ((args.payload_bytes + 31) // 32))[
+                    : args.payload_bytes
+                ]
+                buffer.fill(payload)
+            expected = checksum()
+            mounted = producer.allocate_and_mount_segment(args.segment_bytes)
+            if mounted["ret"] != 0:
+                raise RuntimeError(f"Segment allocation failed: {mounted}")
             batches(producer, "put", keys)
-            # Same-policy dedup must suppress another put exactly as the connector does.
             hits = timed(
                 "same_policy_exists",
                 lambda client=producer, batch_keys=keys: client.batch_is_exist(
@@ -188,36 +233,30 @@ def main():
             ]
             rc = timed(
                 "unmount",
-                lambda client=producer, ids=mounted["segment_ids"]: (
-                    client.unmount_and_free_segment(ids, 0)
-                ),
+                lambda client=producer,
+                ids=mounted["segment_ids"]: client.unmount_and_free_segment(ids, 0),
             )
             if rc != 0:
                 raise RuntimeError(f"Unmount failed: {rc}")
-        finally:
-            producer.close()
-        del producer
-        consumer = setup()
-        try:
-            # Require the read to have no surviving memory replica. The USRBIO trace
-            # must independently demonstrate read submissions before calling it DFS.
             after = [
-                sum(d.is_memory_replica() for d in consumer.get_replica_desc(k))
+                sum(d.is_memory_replica() for d in producer.get_replica_desc(k))
                 for k in keys
             ]
             if any(after):
-                raise RuntimeError(f"Memory replicas survived producer close: {after}")
+                raise RuntimeError(
+                    f"Memory replicas survived explicit unmount: {after}"
+                )
             for buffer in buffers:
-                ctypes.memset(buffer, 0, args.payload_bytes)
-            batches(consumer, "dfs_get", keys)
+                buffer.clear()
+            batches(producer, "dfs_get", keys)
             if checksum() != expected:
                 raise RuntimeError("DFS-tier KV checksum mismatch")
             removed = timed(
-                "reset", lambda client=consumer: client.remove_all(force=True)
+                "reset", lambda client=producer: client.remove_all(force=True)
             )
             stale = timed(
                 "stale_check",
-                lambda client=consumer, batch_keys=keys: client.batch_is_exist(
+                lambda client=producer, batch_keys=keys: client.batch_is_exist(
                     batch_keys
                 ),
                 keys=len(keys),
@@ -236,11 +275,11 @@ def main():
                     "checksums": expected,
                 }
             )
-        finally:
-            consumer.close()
-        del consumer
+    finally:
+        producer.close()
+        del producer
     summary = {
-        "level": "real Mooncake+3FS; synthetic CPU KV lifecycle",
+        "level": f"real Mooncake+3FS; synthetic {args.device} KV lifecycle",
         "arguments": {
             k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
         },
