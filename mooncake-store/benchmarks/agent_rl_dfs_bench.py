@@ -75,6 +75,10 @@ def main():
         "--policy-key-mode", choices=["epoch", "reuse"], default="epoch"
     )
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--save-precheck", choices=["on", "off"], default="off")
+    parser.add_argument(
+        "--warm-fraction", type=float, choices=[0.0, 0.5, 1.0], default=0.0
+    )
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--slices", type=int, default=56)
     parser.add_argument("--local-buffer-bytes", type=int, default=16 * 1024 * 1024)
@@ -160,13 +164,32 @@ def main():
             stop = min(start + args.batch_size, len(keys))
 
             def fn():
-                if operation == "put":
-                    result = client.batch_put_from_multi_buffers(
-                        keys[start:stop],
-                        pointers[start:stop],
-                        all_sizes[start:stop],
-                        replica,
-                    )
+                if operation in ("put", "warm_put"):
+                    indices = list(range(start, stop))
+                    if operation == "put" and args.save_precheck == "on":
+                        states = timed(
+                            "save_exists",
+                            lambda: client.batch_is_exist(keys[start:stop]),
+                            keys=stop - start,
+                        )
+                        if len(states) != stop - start or any(v < 0 for v in states):
+                            raise RuntimeError(f"Existence query failed: {states}")
+                        indices = [i for i in indices if states[i - start] != 1]
+                    if indices:
+                        transferred = timed(
+                            "native_put",
+                            lambda: client.batch_put_from_multi_buffers(
+                                [keys[i] for i in indices],
+                                [pointers[i] for i in indices],
+                                [all_sizes[i] for i in indices],
+                                replica,
+                            ),
+                            keys=len(indices),
+                            phase=operation,
+                        )
+                        if len(transferred) != len(indices) or any(transferred):
+                            raise RuntimeError(f"Native put failed: {transferred}")
+                    result = [0] * (stop - start)
                 else:
                     result = client.batch_get_into_multi_buffers(
                         keys[start:stop], pointers[start:stop], all_sizes[start:stop]
@@ -181,7 +204,7 @@ def main():
                 logical_bytes=(stop - start) * args.payload_bytes,
             )
             # put returns zero on success; get returns the completed byte count.
-            expected = 0 if operation == "put" else args.payload_bytes
+            expected = 0 if operation in ("put", "warm_put") else args.payload_bytes
             if len(results) != stop - start or any(rc != expected for rc in results):
                 raise RuntimeError(
                     f"{operation} failed: {results}, expected {expected}"
@@ -221,6 +244,12 @@ def main():
             mounted = producer.allocate_and_mount_segment(args.segment_bytes)
             if mounted["ret"] != 0:
                 raise RuntimeError(f"Segment allocation failed: {mounted}")
+            warm_keys = int(args.keys * args.warm_fraction)
+            if warm_keys:
+                batches(producer, "warm_put", keys[:warm_keys])
+                # Conflicting duplicate payloads must never replace published KV.
+                for buffer in buffers[:warm_keys]:
+                    buffer.fill(bytes([0xA5]) * args.payload_bytes)
             batches(producer, "put", keys)
             hits = timed(
                 "same_policy_exists",
@@ -314,6 +343,8 @@ def main():
             "calls": len(selected),
             "wall_ns": sum(e["wall_ns"] for e in selected),
             "median_wall_ns": statistics.median(e["wall_ns"] for e in selected),
+            "cpu_ns": sum(e["cpu_ns"] for e in selected),
+            "keys": sum(e.get("keys", 0) for e in selected),
         }
     (args.output / "events.jsonl").write_text(
         "".join(json.dumps(e) + "\n" for e in events)
