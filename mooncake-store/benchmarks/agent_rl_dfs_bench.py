@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Deterministic KV lifecycle benchmark against an explicitly dedicated master.
 
-CPU buffers exercise the real Store/DFS adapter. This is not a GPU staging or
-trainer benchmark. Keep the master and filesystem namespace exclusive to this
+CPU and optional CUDA buffers exercise the real Store/DFS adapter. This is
+a synthetic lifecycle benchmark, independent of trainer scheduling. Keep the master and filesystem namespace exclusive to this
 run: invalidation intentionally removes all keys in that master.
 """
 
@@ -71,6 +71,9 @@ def main():
     parser.add_argument("--payload-bytes", type=int, default=458752)
     parser.add_argument("--keys", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=4)
+    parser.add_argument(
+        "--policy-key-mode", choices=["epoch", "reuse"], default="epoch"
+    )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--slices", type=int, default=56)
@@ -204,7 +207,10 @@ def main():
     producer = setup()
     try:
         for epoch in range(args.epochs):
-            keys = [f"agent-rl-policy-{epoch}-prefix-{i}" for i in range(args.keys)]
+            policy_key = epoch if args.policy_key_mode == "epoch" else "reused"
+            keys = [
+                f"agent-rl-policy-{policy_key}-prefix-{i}" for i in range(args.keys)
+            ]
             for i, buffer in enumerate(buffers):
                 seed = hashlib.sha256(f"policy={epoch},prefix={i}".encode()).digest()
                 payload = (seed * ((args.payload_bytes + 31) // 32))[
@@ -225,6 +231,8 @@ def main():
             )
             if hits != [1] * len(keys):
                 raise RuntimeError(f"Existing KV keys missing: {hits}")
+            for buffer in buffers:
+                buffer.clear()
             batches(producer, "memory_get", keys)
             if checksum() != expected:
                 raise RuntimeError("Memory-tier KV checksum mismatch")
@@ -298,7 +306,6 @@ def main():
         ),
         "logical_put_bytes": args.payload_bytes * args.keys * args.epochs,
         "logical_dfs_read_bytes": args.payload_bytes * args.keys * args.epochs,
-        "dedup_suppressed_put_bytes": args.payload_bytes * args.keys * args.epochs,
         "lifecycle": lifecycle,
     }
     for operation in sorted({event["operation"] for event in events}):

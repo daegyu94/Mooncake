@@ -58,7 +58,7 @@ Every put and get result is checked, restored buffers are zeroed before reading,
 Use phase durations for throughput with concurrent clients because summed request durations overlap.
 Peak RSS is process peak RSS; process CPU includes setup, checksum validation and teardown.
 Per-call CPU durations overlap with other threads.
-Size the experimental 64 MiB staging pool for the live in-flight workload before production use.
+Size the experimental 64 MiB offload RPC arena for actual remote offload use before production use.
 
 Use fio's official USRBIO engine to isolate overwrite geometry with the same chunk size and request bytes.
 It omits Store metadata, allocator placement, duplicate suppression, staging copies and invalidation.
@@ -77,3 +77,10 @@ Use `--local-buffer-bytes 134217728` for those scenarios, keep it equal between
 allocator variants and repetitions, and disclose the larger buffer capacity.
 The raw `staging_pool_bytes` summary field records the offload RPC arena setting,
 not the independent GPU D2H pinned-buffer pool.
+
+Use `--policy-key-mode reuse` to reuse identical keys after each drained reset while changing payload bytes.
+This matches an unsalted prefix key lifecycle and checks that a prior policy cannot survive under the same key.
+Memory-tier destinations are also cleared before restoration.
+Earlier summaries at commit `4466e4d` include a `dedup_suppressed_put_bytes` field, but no repeated put was submitted.
+That field is an accounting error and must be ignored; this revision removes it.
+Same-policy existence checks and memory gets demonstrate reuse, and do not quantify duplicate suppression savings.
