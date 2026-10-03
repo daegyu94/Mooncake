@@ -613,7 +613,20 @@ void MasterService::InitDfsAllocatorFromEnvironment(
             "DFS is incompatible with snapshot/oplog recovery");
     }
 
-    const auto dfs_config = DistributedStorageConfig::FromEnvironment();
+    auto dfs_config = DistributedStorageConfig::FromEnvironment();
+    const char* region_flag = std::getenv("MOONCAKE_POLICY_REGIONS");
+    const bool policy_regions =
+        region_flag && std::string_view(region_flag) == "1";
+    if (policy_regions) {
+        if (dfs_config.allocator_type != "shard" || dfs_config.eviction_enabled)
+            throw std::invalid_argument(
+                "policy regions require shard allocator and disabled DFS "
+                "eviction");
+        // A restart gets new files. Old open handles cannot alias ranges in a
+        // new incarnation even if disconnected clients still perform I/O.
+        policy_region_config_.boot = UuidToString(generate_uuid());
+        dfs_config.fsdir += "/incarnation-" + policy_region_config_.boot;
+    }
     if (!dfs_config.single_tenant) {
         LOG(ERROR) << "Currently, DFS backend is not supported in "
                       "multi-tenant mode";
@@ -642,6 +655,36 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         bucket_allocator_ = nullptr;
         enable_dfs_ = false;
         return;
+    }
+
+    if (policy_regions) {
+        policy_region_config_.enabled = true;
+        policy_region_config_.fsdir = dfs_config.fsdir;
+        policy_region_config_.adapter = dfs_config.fs_adapter_type;
+        policy_region_config_.alignment = dfs_config.alignment;
+        policy_region_config_.shard_capacity = dfs_config.shard_capacity;
+        policy_region_config_.shard_count = dfs_config.shard_count;
+        policy_regions_ = std::make_unique<PolicyRegionRegistry>(
+            policy_region_config_.boot,
+            [this](const std::string& key, uint64_t bytes) {
+                auto result = dfs_allocator_->Allocate(key, bytes);
+                if (!result)
+                    throw std::runtime_error("region allocation failed");
+                const auto& d = *result;
+                return PolicyExtent{d.file_path, d.offset, d.object_size,
+                                    d.aligned_size, d.shard_idx};
+            },
+            [this](const std::string& key, const PolicyExtent& d) {
+                dfs_allocator_->Free(
+                    key, {d.path, d.offset, d.size, d.aligned_size, d.shard});
+            });
+        policy_region_gc_ = std::jthread([this](std::stop_token stop) {
+            while (!stop.stop_requested()) {
+                policy_regions_->Collect();
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            policy_regions_->Collect();
+        });
     }
 
     LOG(INFO) << "DFS allocator initialized, type="
@@ -691,7 +734,75 @@ MasterService::CreateSnapshotCatalogStore(const MasterServiceConfig& config) {
     throw std::invalid_argument("unknown snapshot catalog store type");
 }
 
+PolicyRegionReply MasterService::RegionReserve(const std::string& policy,
+                                               const std::string& owner,
+                                               const std::string& nonce,
+                                               uint64_t object_size,
+                                               uint64_t stride,
+                                               uint64_t slots) {
+    if (!policy_regions_) return PolicyRegionReply{};
+    if (!stride || stride % policy_region_config_.alignment)
+        return PolicyRegionReply{PolicyRegionCode::INVALID};
+    return policy_regions_->Reserve(policy, owner, nonce, object_size, stride,
+                                    slots);
+}
+PolicyRegionReply MasterService::RegionPublish(
+    const std::string& boot, uint64_t region, const std::string& owner,
+    uint64_t start, const std::vector<std::string>& keys) {
+    if (!policy_regions_) return PolicyRegionReply{};
+    return policy_regions_->Publish(boot, region, owner, start, keys);
+}
+PolicyRegionReply MasterService::RegionAcquire(
+    const std::string& boot, const std::string& policy,
+    const std::string& reader, const std::vector<std::string>& keys) {
+    if (!policy_regions_) return PolicyRegionReply{};
+    return policy_regions_->Acquire(boot, policy, reader, keys);
+}
+PolicyRegionCode MasterService::RegionRelease(const std::string& boot,
+                                              uint64_t read_id,
+                                              const std::string& reader) {
+    if (!policy_regions_) return PolicyRegionCode::UNAVAILABLE;
+    return policy_regions_->Release(boot, read_id, reader);
+}
+PolicyRegionCode MasterService::RegionClose(const std::string& boot,
+                                            uint64_t region,
+                                            const std::string& owner) {
+    if (!policy_regions_) return PolicyRegionCode::UNAVAILABLE;
+    return policy_regions_->Close(boot, region, owner);
+}
+PolicyRegionCode MasterService::RegionJoin(const std::string& boot,
+                                           const std::string& policy,
+                                           const std::string& owner) {
+    return policy_regions_ ? policy_regions_->Join(boot, policy, owner)
+                           : PolicyRegionCode::UNAVAILABLE;
+}
+PolicyRegionCode MasterService::RegionLeave(const std::string& boot,
+                                            const std::string& policy,
+                                            const std::string& owner) {
+    return policy_regions_ ? policy_regions_->Leave(boot, policy, owner)
+                           : PolicyRegionCode::UNAVAILABLE;
+}
+PolicyRegionCode MasterService::RegionRevoke(const std::string& boot,
+                                             const std::string& policy) {
+    if (!policy_regions_) return PolicyRegionCode::UNAVAILABLE;
+    return policy_regions_->Revoke(boot, policy);
+}
+PolicyRegionCode MasterService::RegionReclaim(const std::string& boot,
+                                              const std::string& policy) {
+    if (!policy_regions_) return PolicyRegionCode::UNAVAILABLE;
+    return policy_regions_->Reclaim(boot, policy);
+}
+PolicyRegionStats MasterService::RegionStats() {
+    return policy_regions_ ? policy_regions_->Stats() : PolicyRegionStats{};
+}
+PolicyRegionConfig MasterService::RegionInfo() { return policy_region_config_; }
+
 MasterService::~MasterService() {
+    if (policy_region_gc_.joinable()) {
+        policy_region_gc_.request_stop();
+        policy_region_gc_.join();
+    }
+    policy_regions_.reset();
     // Stop and join the threads
     eviction_running_ = false;
     client_monitor_running_ = false;

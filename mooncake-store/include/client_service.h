@@ -634,6 +634,12 @@ class Client {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+    std::vector<ErrorCode> WritePolicyDfs(
+        const std::vector<std::string>& keys,
+        const std::vector<DistributedFSDescriptor>& descriptors,
+        const std::vector<const std::vector<Slice>*>& slices) {
+        return WriteDfsReplicas(keys, slices, descriptors);
+    }
     void SetDfsStorageBackend(
         std::shared_ptr<DistributedStorageBackend> backend);
 

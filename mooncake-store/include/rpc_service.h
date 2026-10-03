@@ -36,6 +36,32 @@ class WrappedMasterService {
                          const std::string& http_metadata_remote_url = "");
 
     ~WrappedMasterService();
+    tl::expected<PolicyRegionReply, ErrorCode> RegionReserve(
+        const std::string& policy, const std::string& owner,
+        const std::string& nonce, uint64_t object_size, uint64_t stride,
+        uint64_t slots);
+    tl::expected<PolicyRegionReply, ErrorCode> RegionPublish(
+        const std::string& boot, uint64_t region, const std::string& owner,
+        uint64_t start, const std::vector<std::string>& keys);
+    tl::expected<PolicyRegionReply, ErrorCode> RegionAcquire(
+        const std::string& boot, const std::string& policy,
+        const std::string& reader, const std::vector<std::string>& keys);
+    tl::expected<PolicyRegionCode, ErrorCode> RegionRelease(
+        const std::string& boot, uint64_t read_id, const std::string& reader);
+    tl::expected<PolicyRegionCode, ErrorCode> RegionClose(
+        const std::string& boot, uint64_t region, const std::string& owner);
+    tl::expected<PolicyRegionCode, ErrorCode> RegionJoin(
+        const std::string& boot, const std::string& policy,
+        const std::string& owner);
+    tl::expected<PolicyRegionCode, ErrorCode> RegionLeave(
+        const std::string& boot, const std::string& policy,
+        const std::string& owner);
+    tl::expected<PolicyRegionCode, ErrorCode> RegionRevoke(
+        const std::string& boot, const std::string& policy);
+    tl::expected<PolicyRegionCode, ErrorCode> RegionReclaim(
+        const std::string& boot, const std::string& policy);
+    tl::expected<PolicyRegionStats, ErrorCode> RegionStats();
+    tl::expected<PolicyRegionConfig, ErrorCode> RegionInfo();
 
     tl::expected<bool, ErrorCode> ExistKey(
         const std::string& key, const std::string& tenant_id = "default");

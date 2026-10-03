@@ -30,6 +30,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment_allocator_registration.cpp
     client_offboarding.cpp
     master_service.cpp
+    policy_region.cpp
     master_store_backend.cpp
     weight_store_manager.cpp
     master_snapshot_manager.cpp
@@ -798,4 +799,19 @@ if(WITH_STORE_C_SHARED)
     "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/store_c.map"
     "$<$<CONFIG:Release>:-Wl,-s>")
   install(TARGETS mooncake_store_c DESTINATION lib)
+endif()
+
+# Experimental ABI and standalone state-machine tests; ordinary builds omit it.
+option(BUILD_POLICY_REGION_POC "Build policy-region research SDK and tests" OFF)
+if(BUILD_POLICY_REGION_POC)
+  pybind11_add_module(policy_region_native policy_region_python.cpp)
+  target_include_directories(policy_region_native
+                             PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS})
+  target_link_libraries(policy_region_native PRIVATE mooncake_store)
+  add_executable(policy_region_test ../tests/policy_region_test.cpp
+                                    policy_region.cpp)
+  target_include_directories(policy_region_test PRIVATE ../include)
+  target_link_libraries(policy_region_test PRIVATE pthread)
+  enable_testing()
+  add_test(NAME policy_region_test COMMAND policy_region_test)
 endif()

@@ -1802,9 +1802,81 @@ WrappedMasterService::RestoreFromBatchOpLogPromotion(
                                                           chunk_object_count);
 }
 
+tl::expected<PolicyRegionReply, ErrorCode> WrappedMasterService::RegionReserve(
+    const std::string& policy, const std::string& owner,
+    const std::string& nonce, uint64_t object_size, uint64_t stride,
+    uint64_t slots) {
+    return master_service_.RegionReserve(policy, owner, nonce, object_size,
+                                         stride, slots);
+}
+tl::expected<PolicyRegionReply, ErrorCode> WrappedMasterService::RegionPublish(
+    const std::string& boot, uint64_t region, const std::string& owner,
+    uint64_t start, const std::vector<std::string>& keys) {
+    return master_service_.RegionPublish(boot, region, owner, start, keys);
+}
+tl::expected<PolicyRegionReply, ErrorCode> WrappedMasterService::RegionAcquire(
+    const std::string& boot, const std::string& policy,
+    const std::string& reader, const std::vector<std::string>& keys) {
+    return master_service_.RegionAcquire(boot, policy, reader, keys);
+}
+tl::expected<PolicyRegionCode, ErrorCode> WrappedMasterService::RegionRelease(
+    const std::string& boot, uint64_t read_id, const std::string& reader) {
+    return master_service_.RegionRelease(boot, read_id, reader);
+}
+tl::expected<PolicyRegionCode, ErrorCode> WrappedMasterService::RegionClose(
+    const std::string& boot, uint64_t region, const std::string& owner) {
+    return master_service_.RegionClose(boot, region, owner);
+}
+tl::expected<PolicyRegionCode, ErrorCode> WrappedMasterService::RegionJoin(
+    const std::string& boot, const std::string& policy,
+    const std::string& owner) {
+    return master_service_.RegionJoin(boot, policy, owner);
+}
+tl::expected<PolicyRegionCode, ErrorCode> WrappedMasterService::RegionLeave(
+    const std::string& boot, const std::string& policy,
+    const std::string& owner) {
+    return master_service_.RegionLeave(boot, policy, owner);
+}
+tl::expected<PolicyRegionCode, ErrorCode> WrappedMasterService::RegionRevoke(
+    const std::string& boot, const std::string& policy) {
+    return master_service_.RegionRevoke(boot, policy);
+}
+tl::expected<PolicyRegionCode, ErrorCode> WrappedMasterService::RegionReclaim(
+    const std::string& boot, const std::string& policy) {
+    return master_service_.RegionReclaim(boot, policy);
+}
+tl::expected<PolicyRegionStats, ErrorCode> WrappedMasterService::RegionStats() {
+    return master_service_.RegionStats();
+}
+tl::expected<PolicyRegionConfig, ErrorCode> WrappedMasterService::RegionInfo() {
+    return master_service_.RegionInfo();
+}
+
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
+    server.register_handler<&WrappedMasterService::RegionReserve>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::RegionPublish>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::RegionAcquire>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::RegionRelease>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::RegionClose>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::RegionJoin>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::RegionLeave>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::RegionRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::RegionReclaim>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::RegionStats>(
+        &wrapped_master_service);
+    server.register_handler<&WrappedMasterService::RegionInfo>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ProbeKey>(

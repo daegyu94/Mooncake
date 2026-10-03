@@ -349,6 +349,51 @@ struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
     static constexpr const char* value = "PollRemoveAll";
 };
 
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegionReserve> {
+    static constexpr const char* value = "RegionReserve";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegionPublish> {
+    static constexpr const char* value = "RegionPublish";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegionAcquire> {
+    static constexpr const char* value = "RegionAcquire";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegionRelease> {
+    static constexpr const char* value = "RegionRelease";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegionClose> {
+    static constexpr const char* value = "RegionClose";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegionJoin> {
+    static constexpr const char* value = "RegionJoin";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegionLeave> {
+    static constexpr const char* value = "RegionLeave";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegionRevoke> {
+    static constexpr const char* value = "RegionRevoke";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegionReclaim> {
+    static constexpr const char* value = "RegionReclaim";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegionStats> {
+    static constexpr const char* value = "RegionStats";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegionInfo> {
+    static constexpr const char* value = "RegionInfo";
+};
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
     const std::shared_ptr<RpcClientPool::ClientPool>& client_pool,
@@ -620,6 +665,64 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
 
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<PolicyRegionReply, ErrorCode> MasterClient::RegionReserve(
+    const std::string& policy, const std::string& owner,
+    const std::string& nonce, uint64_t object_size, uint64_t stride,
+    uint64_t slots) {
+    return invoke_rpc<&WrappedMasterService::RegionReserve, PolicyRegionReply>(
+        policy, owner, nonce, object_size, stride, slots);
+}
+tl::expected<PolicyRegionReply, ErrorCode> MasterClient::RegionPublish(
+    const std::string& boot, uint64_t region, const std::string& owner,
+    uint64_t start, const std::vector<std::string>& keys) {
+    return invoke_rpc<&WrappedMasterService::RegionPublish, PolicyRegionReply>(
+        boot, region, owner, start, keys);
+}
+tl::expected<PolicyRegionReply, ErrorCode> MasterClient::RegionAcquire(
+    const std::string& boot, const std::string& policy,
+    const std::string& reader, const std::vector<std::string>& keys) {
+    return invoke_rpc<&WrappedMasterService::RegionAcquire, PolicyRegionReply>(
+        boot, policy, reader, keys);
+}
+tl::expected<PolicyRegionCode, ErrorCode> MasterClient::RegionRelease(
+    const std::string& boot, uint64_t read_id, const std::string& reader) {
+    return invoke_rpc<&WrappedMasterService::RegionRelease, PolicyRegionCode>(
+        boot, read_id, reader);
+}
+tl::expected<PolicyRegionCode, ErrorCode> MasterClient::RegionClose(
+    const std::string& boot, uint64_t region, const std::string& owner) {
+    return invoke_rpc<&WrappedMasterService::RegionClose, PolicyRegionCode>(
+        boot, region, owner);
+}
+tl::expected<PolicyRegionCode, ErrorCode> MasterClient::RegionJoin(
+    const std::string& boot, const std::string& policy,
+    const std::string& owner) {
+    return invoke_rpc<&WrappedMasterService::RegionJoin, PolicyRegionCode>(
+        boot, policy, owner);
+}
+tl::expected<PolicyRegionCode, ErrorCode> MasterClient::RegionLeave(
+    const std::string& boot, const std::string& policy,
+    const std::string& owner) {
+    return invoke_rpc<&WrappedMasterService::RegionLeave, PolicyRegionCode>(
+        boot, policy, owner);
+}
+tl::expected<PolicyRegionCode, ErrorCode> MasterClient::RegionRevoke(
+    const std::string& boot, const std::string& policy) {
+    return invoke_rpc<&WrappedMasterService::RegionRevoke, PolicyRegionCode>(
+        boot, policy);
+}
+tl::expected<PolicyRegionCode, ErrorCode> MasterClient::RegionReclaim(
+    const std::string& boot, const std::string& policy) {
+    return invoke_rpc<&WrappedMasterService::RegionReclaim, PolicyRegionCode>(
+        boot, policy);
+}
+tl::expected<PolicyRegionStats, ErrorCode> MasterClient::RegionStats() {
+    return invoke_rpc<&WrappedMasterService::RegionStats, PolicyRegionStats>();
+}
+tl::expected<PolicyRegionConfig, ErrorCode> MasterClient::RegionInfo() {
+    return invoke_rpc<&WrappedMasterService::RegionInfo, PolicyRegionConfig>();
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(

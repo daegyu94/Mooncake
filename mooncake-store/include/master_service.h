@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include "policy_region.h"
 #include <atomic>
 #include <boost/functional/hash.hpp>
 #include <chrono>
@@ -141,6 +142,35 @@ class MasterService {
     using BatchOpLogWriterFactory =
         std::function<std::unique_ptr<OrderedOpLogWriter>(
             OrderedOpLogWriterConfig, OrderedOpLogWriter::WriteBatchFn)>;
+
+    PolicyRegionReply RegionReserve(const std::string& policy,
+                                    const std::string& owner,
+                                    const std::string& nonce,
+                                    uint64_t object_size, uint64_t stride,
+                                    uint64_t slots);
+    PolicyRegionReply RegionPublish(const std::string& boot, uint64_t region,
+                                    const std::string& owner, uint64_t start,
+                                    const std::vector<std::string>& keys);
+    PolicyRegionReply RegionAcquire(const std::string& boot,
+                                    const std::string& policy,
+                                    const std::string& reader,
+                                    const std::vector<std::string>& keys);
+    PolicyRegionCode RegionRelease(const std::string& boot, uint64_t read_id,
+                                   const std::string& reader);
+    PolicyRegionCode RegionClose(const std::string& boot, uint64_t region,
+                                 const std::string& owner);
+    PolicyRegionCode RegionJoin(const std::string& boot,
+                                const std::string& policy,
+                                const std::string& owner);
+    PolicyRegionCode RegionLeave(const std::string& boot,
+                                 const std::string& policy,
+                                 const std::string& owner);
+    PolicyRegionCode RegionRevoke(const std::string& boot,
+                                  const std::string& policy);
+    PolicyRegionCode RegionReclaim(const std::string& boot,
+                                   const std::string& policy);
+    PolicyRegionStats RegionStats();
+    PolicyRegionConfig RegionInfo();
 
     MasterService();
     MasterService(const MasterServiceConfig& config);
@@ -2246,6 +2276,9 @@ class MasterService {
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
     std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
+    PolicyRegionConfig policy_region_config_;
+    std::unique_ptr<PolicyRegionRegistry> policy_regions_;
+    std::jthread policy_region_gc_;
     ShardAllocator* shard_allocator_{nullptr};
     ImmutableBucketAllocator* bucket_allocator_{nullptr};
     // Serializes allocation-failure recovery so concurrent writers can reuse
