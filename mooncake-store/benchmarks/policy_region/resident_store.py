@@ -336,6 +336,10 @@ class ResidentStore:
                 data = (io or self.io).io(g.fd, ranges, read=True)
                 for i, value in zip(positions, data):
                     values[i] = memoryview(value)
+            with self.lock:
+                self._observe_read(g, blocks)
+            if ranges:
+                self._admit_read(g, blocks, positions, data)
             yield values
         finally:
             with self.lock:
@@ -348,6 +352,12 @@ class ResidentStore:
                 g.leases[lease.token] -= 1
                 g.io_refs -= 1
                 self._collect(lease.policy)
+
+    def _observe_read(self, generation, blocks):
+        """Optional replacement-policy hook, called under the owner lock."""
+
+    def _admit_read(self, generation, blocks, positions, data):
+        """Optional best-effort admission while the operation still pins data."""
 
     def snapshot(self):
         with self.lock:
