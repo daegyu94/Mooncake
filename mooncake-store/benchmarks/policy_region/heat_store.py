@@ -228,7 +228,10 @@ class HeatResidentStore(ResidentStore):
                     gain = max(0, min(8, freq) - 1) * b.size
                     # Plan the entire replacement before side effects. A large
                     # candidate must not evict a few small victims then give up.
-                    if freed < need or cost > gain:
+                    # Equal value preserves incumbents instead of cycling a
+                    # uniform scan through clean entries. Free space remains
+                    # admissible at the existing second-demand threshold.
+                    if freed < need or (need and cost >= gain):
                         self.metrics["admission_rejections"] += 1
                         continue
                 failed = False

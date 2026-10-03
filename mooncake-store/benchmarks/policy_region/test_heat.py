@@ -70,7 +70,7 @@ def test_hot_clean_block_not_unconditionally_evicted(tmp_path, mode):
     p = s.create("A", 64)
     lease = s.acquire(p, "A")
     fill(s, p, 3)
-    # Admit already-persisted object on second demand; cost comparison is shared.
+    # Third demand beats a cold dirty incumbent; cost comparison is shared.
     for _ in range(4):
         read(s, lease, [0])
     assert s.policies[p].blocks[0].data is not None
@@ -122,6 +122,7 @@ def test_failed_admission_spill_does_not_fail_successful_get(tmp_path):
     lease = s.acquire(p, "A")
     fill(s, p, 2)
     read(s, lease, [0])
+    read(s, lease, [0])  # Equality preserves the dirty incumbent.
     io.fail = True
     read(s, lease, [0])
     assert s.metrics["admission_failures"] == 1
@@ -152,7 +153,7 @@ def test_large_admission_plans_all_small_victims(tmp_path):
     s.put(big, b"L" * 512)
     small = s.create("small", 64)
     fill(s, small, 8)
-    for _ in range(2):
+    for _ in range(3):
         with s.read(bl, [0]) as values:
             assert values[0] == b"L" * 512
     assert s.policies[big].blocks[0].data is not None
@@ -182,3 +183,96 @@ def test_impossible_large_admission_has_no_partial_spills(tmp_path):
     s.release(bl)
     s.revoke(small)
     s.release(sl)
+
+
+@pytest.mark.parametrize("mode", ["heat_lru", "adaptive"])
+@pytest.mark.parametrize("slots", [1, 4])
+def test_uniform_hot_scan_preserves_equal_value_incumbents(tmp_path, mode, slots):
+    s, io = create(tmp_path, mode, slots)
+    p = s.create("A", 64)
+    lease = s.acquire(p, "A")
+    fill(s, p, 8)
+    incumbents = list(range(8 - slots, 8))
+    for _ in range(8):
+        for ordinal in range(8):
+            read(s, lease, [ordinal])
+    assert [b.ordinal for b in s.resident.values()] == incumbents
+    assert s.metrics["admission_count"] == 0
+    assert s.metrics["admission_rejections"] == (8 - slots) * 8
+    assert s.metrics["ram_read_bytes"] == slots * 8 * 64
+    assert io.reads == (8 - slots) * 8 * 64
+    assert io.writes == (8 - slots) * 64
+    s.revoke(p)
+    s.release(lease)
+    assert not io.files
+
+
+@pytest.mark.parametrize("mode", ["heat_lru", "adaptive"])
+@pytest.mark.parametrize("slots", [1, 4])
+def test_uniform_hot_scan_preserves_equal_value_clean_incumbents(tmp_path, mode, slots):
+    s, io = create(tmp_path, mode, slots)
+    p = s.create("A", 64)
+    lease = s.acquire(p, "A")
+    fill(s, p, 8)
+    for b in list(s.resident.values()):
+        s._spill(b)
+    # Successful reads train equal heat while a writer disables optional fill.
+    with s.mutation:
+        for _ in range(8):
+            for ordinal in range(8):
+                read(s, lease, [ordinal])
+    incumbents = list(range(8 - slots, 8))
+    for ordinal in incumbents:
+        read(s, lease, [ordinal])  # Free-space admission of clean entries.
+    before = s.snapshot()["metrics"]
+    reads, writes = io.reads, io.writes
+    for _ in range(8):
+        for ordinal in range(8):
+            read(s, lease, [ordinal])
+    assert [b.ordinal for b in s.resident.values()] == incumbents
+    assert all(b.dfs for b in s.resident.values())
+    assert s.metrics["admission_count"] == before["admission_count"] == slots
+    assert s.metrics["ram_read_bytes"] - before["ram_read_bytes"] == slots * 8 * 64
+    assert io.reads - reads == (8 - slots) * 8 * 64
+    assert io.writes == writes and s.metrics["admission_dirty_spill_bytes"] == 0
+    s.revoke(p)
+    s.release(lease)
+
+
+@pytest.mark.parametrize("mode", ["heat_lru", "adaptive"])
+def test_stronger_candidate_admitted_after_equal_value_rejection(tmp_path, mode):
+    s, io = create(tmp_path, mode, slots=1)
+    p = s.create("A", 64)
+    lease = s.acquire(p, "A")
+    fill(s, p, 2)
+    for _ in range(2):
+        read(s, lease, [0])
+    assert s.policies[p].blocks[0].data is None
+    assert s.metrics["admission_dirty_spill_bytes"] == 0
+    read(s, lease, [0])
+    assert s.policies[p].blocks[0].data is not None
+    assert s.metrics["admission_count"] == 1
+    assert s.metrics["admission_dirty_spill_bytes"] == 64
+    assert io.reads == 3 * 64 and io.writes == 2 * 64
+    s.revoke(p)
+    s.release(lease)
+
+
+@pytest.mark.parametrize("mode", ["heat_lru", "adaptive"])
+def test_free_capacity_still_admits_on_second_demand(tmp_path, mode):
+    s, io = create(tmp_path, mode, slots=1)
+    p = s.create("A", 64)
+    lease = s.acquire(p, "A")
+    fill(s, p, 2)
+    s._spill(s.policies[p].blocks[1])
+    assert s.used == 0
+    writes = io.writes
+    read(s, lease, [0])
+    assert s.policies[p].blocks[0].data is None
+    read(s, lease, [0])
+    assert s.policies[p].blocks[0].data is not None
+    assert s.metrics["admission_count"] == 1
+    assert s.metrics["admission_dirty_spill_bytes"] == 0
+    assert io.writes == writes and io.reads == 2 * 64
+    s.revoke(p)
+    s.release(lease)
