@@ -67,6 +67,8 @@ struct ThreadUSRBIOResource {
 
     // Resource initialization status
     bool initialized;
+    // A malformed completion fences this ring from further submissions.
+    bool io_failed = false;
 
     // Resource belongs to parameters
     Hf3fsConfig config_;

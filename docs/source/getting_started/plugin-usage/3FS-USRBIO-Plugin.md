@@ -90,3 +90,20 @@ during client initialization.
 For the complete configuration reference, request example, synchronous write
 semantics, and current recovery limitations, see the {ref}`DFS deployment
 documentation <dfs-storage>`.
+
+### Descriptor I/O batching and concurrency
+
+Descriptor-based DFS reads and writes prepare a bounded window of native I/O before submitting it. Each request owns a separate region of the thread's shared IOV; the adapter drains every prepared request before returning, including after an error. Completion indices and exact byte counts are checked, and per-object results retain the input order.
+
+Configure these limits on every DFS client before initialization:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MOONCAKE_DFS_IO_BATCH_SIZE` | `16` | Maximum requests per window, capped by the thread's ring capacity. |
+| `MOONCAKE_DFS_IO_BATCH_BYTES` | `33554432` | Maximum shared IOV bytes per window, including alignment padding; minimum `4096`, capped by the existing IOV size. |
+
+Set the request limit to `1` to use sequential submission. Calls do not accumulate work across batches or add a batching delay. The existing 32 MiB thread IOV allocation is unchanged, and file-level `ReadFile`/`WriteFile` operations do not use this batching path.
+
+Within one backend instance, reads may run concurrently with a write to a disjoint allocation range in the same shard. Overlapping reads are allowed; a write excludes overlapping reads until its I/O finishes. Writes to the same shard remain serialized to protect filesystem write metadata beyond individual byte ranges. Shard leases are acquired in ascending shard order, and earlier conflicting waiters are respected. This is process-local coordination: the allocator and descriptor protocol still govern cross-process ownership and late writers.
+
+The native API provides no cancellation guarantee for already prepared I/O. A failed submit notification still requires completion draining; if the native completion path stops permanently, the call can remain blocked. A malformed completion fences the thread resource from subsequent descriptor submissions.

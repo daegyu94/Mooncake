@@ -175,4 +175,43 @@ TEST_F(Hf3fsAdapterTest, DistributedBackendBatchWriteAndRead) {
               0);
 }
 
+TEST_F(Hf3fsAdapterTest, BatchedVectorsAndLargeObjectSurviveResourceRestart) {
+    const auto path = test_dir_->file("batch_restart.data");
+    std::vector<std::vector<char>> values;
+    std::vector<FileIoRequest> writes;
+    for (size_t i = 0; i < 20; ++i) {
+        values.emplace_back(i == 19 ? (35ULL << 20) + 17 : 6001 + i, 'a' + i);
+    }
+    Hf3fsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(test_dir_->path()));
+    auto fd = adapter.OpenFile(path);
+    ASSERT_TRUE(fd);
+    int64_t offset = 0;
+    for (auto& value : values) {
+        const size_t split = value.size() / 3;
+        writes.push_back({*fd,
+                          {{value.data(), split},
+                           {value.data() + split, value.size() - split}},
+                          offset});
+        offset += (value.size() + 4095) / 4096 * 4096;
+    }
+    for (auto& result : adapter.BatchWriteAt(writes)) ASSERT_TRUE(result);
+    ASSERT_TRUE(adapter.CloseFile(*fd));
+    ASSERT_TRUE(adapter.Shutdown());
+    ASSERT_TRUE(adapter.Init(test_dir_->path()));
+    fd = adapter.OpenFile(path);
+    ASSERT_TRUE(fd);
+    std::vector<std::vector<char>> outputs;
+    for (const auto& value : values) outputs.emplace_back(value.size());
+    std::vector<FileIoRequest> reads;
+    for (size_t i = 0; i < outputs.size(); ++i)
+        reads.push_back(
+            {*fd, {{outputs[i].data(), outputs[i].size()}}, writes[i].offset});
+    auto results = adapter.BatchReadAt(reads);
+    ASSERT_EQ(results.size(), outputs.size());
+    for (const auto& result : results) ASSERT_TRUE(result);
+    EXPECT_EQ(values, outputs);
+    EXPECT_TRUE(adapter.CloseFile(*fd));
+}
+
 }  // namespace mooncake::test
