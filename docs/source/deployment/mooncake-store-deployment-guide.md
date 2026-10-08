@@ -1438,3 +1438,12 @@ export MC_YLT_LOG_LEVEL=info
 ```
 
 Available: `trace`, `debug`, `info`, `warn` (or `warning`), `error`, `critical`. When unset (or set to an unrecognized value), the level defaults to `warn`.
+
+
+## Strict namespace invalidation
+
+Legacy `remove_by_regex(..., force=True)` and `remove_all(force=True)` are best-effort operations: active replicas/tasks and HA failures can leave keys behind while returning a nonnegative removal count. `force` bypasses leases; it does not guarantee complete deletion.
+
+The native RealClient SDK provides `remove_by_regex_strict(pattern)` and `remove_all_strict()`. These call distinct Master RPCs and verify matching metadata and active processing/task entries across a consistent snapshot, including objects without readable replicas. Residual work returns `REPLICA_IS_NOT_READY`; an already empty scope returns `0`. Existing best-effort endpoints retain their behavior, and unsupported SDK/proxy clients fail closed.
+
+Before strict invalidation, callers must stop admissions and drain all readers/writers sharing the scope. Every client must also synchronize pending GPU copies and call `invalidate_local_cache(pattern)` to remove matching local hot-cache entries without deleting shared data. A strict reset does not prevent a new write admitted after verification, cancel native I/O, wait indefinitely for HA recovery, or reclaim physical DFS space. Coordinate preparation across all participants before any deletion, and resume only after every deletion is acknowledged.

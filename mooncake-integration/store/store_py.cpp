@@ -2559,8 +2559,35 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->remove(key, force);
             },
             py::arg("key"), py::arg("force") = false,
-            "Remove an object from the store. If force=True, skip lease and "
-            "replication task checks.")
+            "Remove an object from the store. If force=True, bypass leases; "
+            "active "
+            "replicas or replication tasks may still prevent removal.")
+        .def(
+            "invalidate_local_cache",
+            [](MooncakeStorePyWrapper &self, const std::string &pattern) {
+                py::gil_scoped_release release;
+                return self.store_->invalidateLocalCache(pattern);
+            },
+            py::arg("regex_pattern"),
+            "Invalidate matching client-local cache entries without deleting "
+            "shared keys.")
+        .def(
+            "remove_by_regex_strict",
+            [](MooncakeStorePyWrapper &self, const std::string &pattern) {
+                py::gil_scoped_release release;
+                return self.store_->removeByRegexStrict(pattern);
+            },
+            py::arg("regex_pattern"),
+            "Force removal and verify no matching metadata remains. All "
+            "writers "
+            "and readers must be quiescent; partial removal returns an error.")
+        .def(
+            "remove_all_strict",
+            [](MooncakeStorePyWrapper &self) {
+                py::gil_scoped_release release;
+                return self.store_->removeAllStrict();
+            },
+            "Force removal and verify no metadata remains in scope.")
         .def(
             "remove_by_regex",
             [](MooncakeStorePyWrapper &self, const std::string &str,
@@ -2570,8 +2597,8 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("regex_pattern"), py::arg("force") = false,
             "Removes objects from the store whose keys match the given "
-            "regular expression. If force=True, skip lease and replication "
-            "task checks.")
+            "regular expression. If force=True, bypass leases; active replicas "
+            "or replication tasks may still be skipped.")
         .def(
             "remove_all",
             [](MooncakeStorePyWrapper &self, bool force) {
@@ -2579,8 +2606,9 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->removeAll(force);
             },
             py::arg("force") = false,
-            "Remove all objects from the store. If force=True, skip lease "
-            "and replication task checks.")
+            "Remove all objects from the store. If force=True, bypass leases; "
+            "active replicas "
+            "or replication tasks may still be skipped.")
         .def(
             "batch_remove",
             [](MooncakeStorePyWrapper &self,

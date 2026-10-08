@@ -15,6 +15,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <regex>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -674,6 +675,15 @@ class MasterService {
      * @return return the number of objects removed
      */
     long RemoveAll(const TenantId& tenant_id, bool force = false);
+
+    // Requires all matching writers/readers to be quiescent. Unlike the legacy
+    // APIs, success verifies that no matching metadata (including pending
+    // replicas/tasks or HA finalization) remains. Partial removal returns
+    // REPLICA_IS_NOT_READY and can be retried after completion.
+    tl::expected<long, ErrorCode> RemoveByRegexStrict(
+        const std::string& pattern, const TenantId& tenant_id);
+    tl::expected<long, ErrorCode> RemoveAllStrict(
+        const std::optional<TenantId>& tenant_id = std::nullopt);
 
     /**
      * @brief Batch remove objects and their replicas
@@ -2265,6 +2275,8 @@ class MasterService {
     std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
     std::unique_ptr<MasterSnapshotRepository> snapshot_repository_;
     std::unique_ptr<ha::MasterSnapshotCodec> snapshot_codec_;
+    bool NoMatchingMetadata(const std::regex& pattern,
+                            const std::optional<TenantId>& tenant_id);
     mutable std::shared_mutex snapshot_mutex_;
 
     // Discarded replicas management

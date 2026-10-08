@@ -345,6 +345,11 @@ class Client {
      * @return tl::expected<long, ErrorCode> number of removed objects or error
      */
     tl::expected<long, ErrorCode> RemoveAll(bool force = false);
+    tl::expected<long, ErrorCode> RemoveByRegexStrict(
+        const std::string& pattern);
+    tl::expected<long, ErrorCode> RemoveAllStrict();
+    tl::expected<void, ErrorCode> InvalidateLocalCache(
+        const std::string& pattern);
 
     /**
      * @brief Batch remove objects and all their replicas

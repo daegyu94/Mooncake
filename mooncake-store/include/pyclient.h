@@ -510,6 +510,16 @@ class PyClient {
 
     virtual long removeAll(bool force = false) = 0;
 
+    virtual long removeByRegexStrict(const std::string &) {
+        return static_cast<long>(ErrorCode::NOT_SUPPORTED);
+    }
+    virtual int invalidateLocalCache(const std::string &) {
+        return static_cast<int>(ErrorCode::NOT_SUPPORTED);
+    }
+    virtual long removeAllStrict() {
+        return static_cast<long>(ErrorCode::NOT_SUPPORTED);
+    }
+
     virtual std::vector<int> batchRemove(const std::vector<std::string> &keys,
                                          bool force = false) = 0;
 

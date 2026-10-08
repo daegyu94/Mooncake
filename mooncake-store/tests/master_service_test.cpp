@@ -64,6 +64,77 @@ class ScopedEnvVar {
     std::optional<std::string> previous_value_;
 };
 
+TEST_F(MasterServiceTest,
+       StrictRegexRejectsPartialRemovalAndInvisiblePendingKey) {
+    MasterService service(MasterServiceConfig::builder().build());
+    const auto context = PrepareSimpleSegment(service);
+    const auto tenant = TenantId::Default();
+    for (const auto& key : {"job@ready", "job@pending", "other@ready"}) {
+        ASSERT_TRUE(service.PutStart(context.client_id, key, tenant, {1024},
+                                     {.replica_num = 1}));
+        if (std::string_view(key) != "job@pending")
+            ASSERT_TRUE(service.PutEnd(context.client_id, key, tenant,
+                                       ReplicaType::MEMORY));
+    }
+    auto legacy = service.RemoveByRegex("^job@", tenant, true);
+    ASSERT_TRUE(legacy);
+    EXPECT_EQ(*legacy, 1);
+    auto visible = service.GetAllKeys(tenant);
+    ASSERT_TRUE(visible);
+    EXPECT_EQ(*visible, (std::vector<std::string>{"other@ready"}));
+    auto strict = service.RemoveByRegexStrict("^job@", tenant);
+    ASSERT_FALSE(strict);
+    EXPECT_EQ(strict.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    ASSERT_TRUE(service.PutEnd(context.client_id, "job@pending", tenant,
+                               ReplicaType::MEMORY));
+    strict = service.RemoveByRegexStrict("^job@", tenant);
+    ASSERT_TRUE(strict);
+    EXPECT_EQ(*strict, 1);
+    strict = service.RemoveByRegexStrict("^job@", tenant);
+    ASSERT_TRUE(strict);
+    EXPECT_EQ(*strict, 0);
+    auto foreign = service.ExistKey("other@ready", tenant);
+    ASSERT_TRUE(foreign);
+    EXPECT_TRUE(*foreign);
+}
+
+TEST_F(MasterServiceTest,
+       StrictRemoveAllRejectsPendingThenAllowsIdempotentRetry) {
+    MasterService service(MasterServiceConfig::builder().build());
+    const auto context = PrepareSimpleSegment(service);
+    const auto tenant = TenantId::Default();
+    ASSERT_TRUE(service.PutStart(context.client_id, "pending", tenant, {1024},
+                                 {.replica_num = 1}));
+    EXPECT_EQ(service.RemoveAll(true), 0);
+    auto strict = service.RemoveAllStrict();
+    ASSERT_FALSE(strict);
+    EXPECT_EQ(strict.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    ASSERT_TRUE(service.PutEnd(context.client_id, "pending", tenant,
+                               ReplicaType::MEMORY));
+    strict = service.RemoveAllStrict();
+    ASSERT_TRUE(strict);
+    EXPECT_EQ(*strict, 1);
+    strict = service.RemoveAllStrict();
+    ASSERT_TRUE(strict);
+    EXPECT_EQ(*strict, 0);
+}
+
+TEST_F(MasterServiceTest, StrictRegexRejectsInvalidPatternWithoutDeletingKeys) {
+    MasterService service(MasterServiceConfig::builder().build());
+    const auto context = PrepareSimpleSegment(service);
+    const auto tenant = TenantId::Default();
+    ASSERT_TRUE(service.PutStart(context.client_id, "key", tenant, {1024},
+                                 {.replica_num = 1}));
+    ASSERT_TRUE(
+        service.PutEnd(context.client_id, "key", tenant, ReplicaType::MEMORY));
+    auto strict = service.RemoveByRegexStrict("[", tenant);
+    ASSERT_FALSE(strict);
+    EXPECT_EQ(strict.error(), ErrorCode::INVALID_PARAMS);
+    auto exists = service.ExistKey("key", tenant);
+    ASSERT_TRUE(exists);
+    EXPECT_TRUE(*exists);
+}
+
 TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
     const auto scoped =
         TenantId("tenant:with:colon").MakeScopedKey("path/key:with:colon");
@@ -1017,6 +1088,13 @@ TEST_F(MasterServiceTest, RemoveAllKeepsObjectWhenOpLogReservationFails) {
     // force=true clears the lease gate, so the reservation is the only thing
     // left that can stop the removal.
     EXPECT_EQ(0, service->RemoveAll(TenantId::Default(), true));
+    auto strict = service->RemoveAllStrict(TenantId::Default());
+    ASSERT_FALSE(strict);
+    EXPECT_EQ(strict.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    strict = service->RemoveByRegexStrict("^reservation_fail_key$",
+                                          TenantId::Default());
+    ASSERT_FALSE(strict);
+    EXPECT_EQ(strict.error(), ErrorCode::REPLICA_IS_NOT_READY);
 
     auto exists =
         service->ExistKey("reservation_fail_key", TenantId::Default());

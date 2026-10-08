@@ -2582,6 +2582,19 @@ tl::expected<int64_t, ErrorCode> RealClient::removeAll_internal(bool force) {
     return client_->RemoveAll(force);
 }
 
+int RealClient::invalidateLocalCache(const std::string &pattern) {
+    if (!client_) return static_cast<int>(ErrorCode::INVALID_PARAMS);
+    return to_py_ret(client_->InvalidateLocalCache(pattern));
+}
+long RealClient::removeByRegexStrict(const std::string &pattern) {
+    if (!client_) return static_cast<long>(ErrorCode::INVALID_PARAMS);
+    return to_py_ret(client_->RemoveByRegexStrict(pattern));
+}
+long RealClient::removeAllStrict() {
+    if (!client_) return static_cast<long>(ErrorCode::INVALID_PARAMS);
+    return to_py_ret(client_->RemoveAllStrict());
+}
+
 long RealClient::removeAll(bool force) {
     return to_py_ret(removeAll_internal(force));
 }
