@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -11,6 +12,7 @@
 #include "replica.h"
 #include "storage/distributed/object_storage_adapter.h"
 #include "storage_backend.h"
+#include "storage/distributed/shard_io_lock.h"
 
 namespace mooncake {
 
@@ -114,7 +116,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
     struct ShardFile {
         std::string path;
         int fd = -1;
-        std::mutex mutex;
+        ShardIoLock io_lock;
     };
 
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
@@ -124,6 +126,8 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::vector<std::unique_ptr<ShardFile>> shard_files_;
     DistributedStorageMode storage_mode_ = DistributedStorageMode::kFileSystem;
     bool initialized_ = false;
+    // Keep adapters and cached FDs alive until every synchronous I/O returns.
+    mutable std::shared_mutex lifecycle_mutex_;
 };
 
 }  // namespace mooncake

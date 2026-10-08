@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -768,6 +770,94 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     int fail_read_call_ = -1;
     int short_read_call_ = -1;
 };
+
+class BlockingPosixFsAdapter : public PosixFsAdapter {
+   public:
+    std::promise<void> entered, release;
+    std::atomic<bool> block_next{false};
+    bool fail = false;
+    tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov, int count,
+                                            int64_t offset) override {
+        if (block_next.exchange(false)) {
+            entered.set_value();
+            release.get_future().wait();
+            if (fail) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        return PosixFsAdapter::WriteAt(fd, iov, count, offset);
+    }
+};
+
+TEST_F(DfsBackendTest, DisjointReadProceedsDuringBlockedWriteOnSameShard) {
+    FileStorageConfig file_config;
+    DistributedStorageConfig config;
+    config.fsdir = tmp_->path();
+    config.fs_adapter_type = "posix";
+    config.shard_count = 4;
+    config.shard_capacity = 64 * 1024 * 1024;
+    auto adapter = std::make_unique<BlockingPosixFsAdapter>();
+    auto* control = adapter.get();
+    DistributedStorageBackend backend(file_config, config, std::move(adapter));
+    ASSERT_TRUE(backend.Init());
+    std::vector<char> written(4096, 'w'), output(4096);
+    DistributedFSDescriptor first{ShardPath(0), 0, 4096, 4096, 0};
+    DistributedFSDescriptor second{ShardPath(0), 4096, 4096, 4096, 0};
+    ASSERT_TRUE(backend.BatchWrite(
+        {{"second", second, {{written.data(), written.size()}}}})[0]);
+    control->block_next = true;
+    auto writer = std::async(std::launch::async, [&] {
+        return backend.BatchWrite(
+            {{"first", first, {{written.data(), written.size()}}}});
+    });
+    control->entered.get_future().wait();
+    auto reader = std::async(std::launch::async, [&] {
+        return backend.BatchRead(
+            {{"second", second, {{output.data(), output.size()}}}});
+    });
+    EXPECT_EQ(reader.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    control->release
+        .set_value();  // Always unblock, even when the assertion fails.
+    ASSERT_TRUE(writer.get()[0]);
+    ASSERT_TRUE(reader.get()[0]);
+    EXPECT_EQ(written, output);
+}
+
+TEST_F(DfsBackendTest, OverlappingReadWaitsUntilFailedWriteReturns) {
+    FileStorageConfig file_config;
+    DistributedStorageConfig config;
+    config.fsdir = tmp_->path();
+    config.fs_adapter_type = "posix";
+    config.shard_count = 4;
+    config.shard_capacity = 64 * 1024 * 1024;
+    auto adapter = std::make_unique<BlockingPosixFsAdapter>();
+    auto* control = adapter.get();
+    DistributedStorageBackend backend(file_config, config, std::move(adapter));
+    ASSERT_TRUE(backend.Init());
+    std::vector<char> written(4096, 'w'), output(4096);
+    DistributedFSDescriptor descriptor{ShardPath(0), 0, 4096, 4096, 0};
+    ASSERT_TRUE(backend.BatchWrite(
+        {{"key", descriptor, {{written.data(), written.size()}}}})[0]);
+    control->block_next = true;
+    control->fail = true;
+    auto writer = std::async(std::launch::async, [&] {
+        return backend.BatchWrite(
+            {{"key", descriptor, {{written.data(), written.size()}}}});
+    });
+    control->entered.get_future().wait();
+    std::promise<void> reader_started;
+    auto reader = std::async(std::launch::async, [&] {
+        reader_started.set_value();
+        return backend.BatchRead(
+            {{"key", descriptor, {{output.data(), output.size()}}}});
+    });
+    reader_started.get_future().wait();
+    EXPECT_EQ(reader.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+    control->release.set_value();
+    EXPECT_FALSE(writer.get()[0]);
+    ASSERT_TRUE(reader.get()[0]);
+    EXPECT_EQ(written, output);
+}
 
 TEST_F(DfsBackendTest, BatchWriteUsesExplicitDescriptors) {
     AlignedBuffer write_buf(4096);

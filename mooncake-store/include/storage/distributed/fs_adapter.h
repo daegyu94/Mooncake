@@ -4,6 +4,7 @@
 #include <sys/uio.h>
 
 #include <span>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,12 @@ namespace mooncake {
 struct FileInfo {
     std::string name;
     size_t size;
+};
+
+struct FileIoRequest {
+    int fd;
+    std::vector<iovec> iovs;
+    int64_t offset;
 };
 
 /**
@@ -123,6 +130,44 @@ class FileSystemAdapter {
                                                    int /*iovcnt*/,
                                                    int64_t /*offset*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    // Synchronous: every prepared native I/O must be completed before return,
+    // including on error. Results retain the input request order.
+    virtual std::vector<tl::expected<size_t, ErrorCode>> BatchWriteAt(
+        const std::vector<FileIoRequest>& requests) {
+        std::vector<tl::expected<size_t, ErrorCode>> results;
+        results.reserve(requests.size());
+        for (const auto& r : requests) {
+            if (r.iovs.size() >
+                static_cast<size_t>(std::numeric_limits<int>::max())) {
+                results.push_back(
+                    tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            } else {
+                results.push_back(WriteAt(r.fd, r.iovs.data(),
+                                          static_cast<int>(r.iovs.size()),
+                                          r.offset));
+            }
+        }
+        return results;
+    }
+
+    virtual std::vector<tl::expected<size_t, ErrorCode>> BatchReadAt(
+        std::vector<FileIoRequest>& requests) {
+        std::vector<tl::expected<size_t, ErrorCode>> results;
+        results.reserve(requests.size());
+        for (auto& r : requests) {
+            if (r.iovs.size() >
+                static_cast<size_t>(std::numeric_limits<int>::max())) {
+                results.push_back(
+                    tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            } else {
+                results.push_back(ReadAt(r.fd, r.iovs.data(),
+                                         static_cast<int>(r.iovs.size()),
+                                         r.offset));
+            }
+        }
+        return results;
     }
 
     // === Lifecycle ===
