@@ -158,6 +158,10 @@ class WrappedMasterService {
         const std::string& str, bool force = false,
         const std::string& tenant_id = "default");
 
+    tl::expected<long, ErrorCode> RemoveByRegexStrict(
+        const std::string& pattern, const std::string& tenant_id);
+    tl::expected<long, ErrorCode> RemoveAllStrict(const std::string& tenant_id);
+
     long RemoveAll(bool force = false,
                    const std::string& tenant_id = "default");
 

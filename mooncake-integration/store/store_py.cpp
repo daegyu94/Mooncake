@@ -2562,6 +2562,23 @@ PYBIND11_MODULE(store, m) {
             "Remove an object from the store. If force=True, skip lease and "
             "replication task checks.")
         .def(
+            "remove_by_regex_strict",
+            [](MooncakeStorePyWrapper &self, const std::string &pattern) {
+                py::gil_scoped_release release;
+                return self.store_->removeByRegexStrict(pattern);
+            },
+            py::arg("regex_pattern"),
+            "Remove and verify matching metadata is absent; callers must fence "
+            "writers.")
+        .def(
+            "remove_all_strict",
+            [](MooncakeStorePyWrapper &self) {
+                py::gil_scoped_release release;
+                return self.store_->removeAllStrict();
+            },
+            "Remove and verify scoped metadata is absent; partial removal "
+            "fails.")
+        .def(
             "remove_by_regex",
             [](MooncakeStorePyWrapper &self, const std::string &str,
                bool force) {

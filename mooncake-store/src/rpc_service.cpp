@@ -916,6 +916,42 @@ tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
         [] { MasterMetricManager::instance().inc_remove_by_regex_failures(); });
 }
 
+tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegexStrict(
+    const std::string& pattern, const std::string& tenant_id) {
+    return execute_rpc(
+        "RemoveByRegexStrict",
+        [&] {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& tenant) {
+                    return master_service_.RemoveByRegexStrict(pattern, tenant);
+                });
+        },
+        [&](auto& timer) { timer.LogRequest("regex=", pattern); },
+        [] { MasterMetricManager::instance().inc_remove_by_regex_requests(); },
+        [] { MasterMetricManager::instance().inc_remove_by_regex_failures(); });
+}
+
+tl::expected<long, ErrorCode> WrappedMasterService::RemoveAllStrict(
+    const std::string& tenant_id) {
+    return execute_rpc(
+        "RemoveAllStrict",
+        [&]() -> tl::expected<long, ErrorCode> {
+            if (tenant_id.empty()) return master_service_.RemoveAllStrict();
+            auto tenant =
+                ResolveRequestTenantId(master_service_.IsTenantQuotaEnabled()
+                                           ? std::string_view(tenant_id)
+                                           : TenantId::kDefaultValue);
+            if (!tenant) return tl::make_unexpected(tenant.error());
+            return master_service_.RemoveAllStrict(*tenant);
+        },
+        [&](auto& timer) { timer.LogRequest("tenant=", tenant_id); },
+        [] { MasterMetricManager::instance().inc_remove_all_requests(); },
+        [] { MasterMetricManager::instance().inc_remove_failures(); });
+}
+
 long WrappedMasterService::RemoveAll(bool force, const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "RemoveAll");
     timer.LogRequest("action=remove_all_objects, force=", force,
@@ -1846,6 +1882,11 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::BatchUpsertRevoke>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Remove>(
+        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::RemoveByRegexStrict>(
+            &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::RemoveAllStrict>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::RemoveByRegex>(
         &wrapped_master_service);

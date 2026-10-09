@@ -344,6 +344,9 @@ class Client {
      * @param force If true, skip lease and replication task checks
      * @return tl::expected<long, ErrorCode> number of removed objects or error
      */
+    tl::expected<long, ErrorCode> RemoveByRegexStrict(
+        const std::string& pattern);
+    tl::expected<long, ErrorCode> RemoveAllStrict();
     tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 
     /**
