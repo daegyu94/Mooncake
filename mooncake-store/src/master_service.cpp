@@ -7554,6 +7554,59 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
     return removed_count;
 }
 
+bool MasterService::NoMatchingMetadata(
+    const std::regex& pattern, const std::optional<TenantId>& tenant_id) {
+    // Make the verification one snapshot across shards. GetAllKeys is
+    // unsuitable: it intentionally omits objects without readable replicas.
+    std::unique_lock snapshot(snapshot_mutex_);
+    for (size_t i = 0; i < kNumShards; ++i) {
+        MetadataShardAccessorRO shard(this, i);
+        for (const auto& [tenant, state] : shard->tenants) {
+            if (tenant_id && tenant != *tenant_id) continue;
+            for (const auto& [key, metadata] : state.metadata) {
+                if (std::regex_search(key, pattern)) return false;
+            }
+            for (const auto& key : state.processing_keys) {
+                if (std::regex_search(key, pattern)) return false;
+            }
+            const auto has_task = [&](const auto& tasks) {
+                for (const auto& [key, task] : tasks) {
+                    if (std::regex_search(key, pattern)) return true;
+                }
+                return false;
+            };
+            if (has_task(state.replication_tasks) ||
+                has_task(state.offloading_tasks) ||
+                has_task(state.promotion_tasks) ||
+                has_task(state.dynamic_replication_pending))
+                return false;
+        }
+    }
+    return true;
+}
+
+tl::expected<long, ErrorCode> MasterService::RemoveByRegexStrict(
+    const std::string& pattern, const TenantId& tenant_id) {
+    auto removed = RemoveByRegex(pattern, tenant_id, true);
+    if (!removed) return removed;
+    const auto normalized = ResolveRequestTenantId(tenant_id);
+    if (!NoMatchingMetadata(std::regex(pattern), normalized))
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    return removed;
+}
+
+tl::expected<long, ErrorCode> MasterService::RemoveAllStrict(
+    const std::optional<TenantId>& tenant_id) {
+    const long removed =
+        tenant_id ? RemoveAll(*tenant_id, true) : RemoveAll(true);
+    const auto normalized =
+        tenant_id ? std::optional{ResolveRequestTenantId(*tenant_id)}
+                  : std::nullopt;
+    if (!NoMatchingMetadata(std::regex(".*"), normalized))
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    return removed;
+}
+
 long MasterService::RemoveAll(bool force) {
     long removed_count = 0;
     int64_t total_freed_size = 0;

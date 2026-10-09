@@ -3735,6 +3735,24 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
     return result.value();
 }
 
+tl::expected<long, ErrorCode> Client::RemoveByRegexStrict(
+    const std::string& pattern) {
+    if (hot_cache_) hot_cache_->BumpCacheEpoch();
+    auto result = master_client_.RemoveByRegexStrict(pattern);
+    if (result && hot_cache_) hot_cache_->RemoveHotKeysByRegex(pattern);
+    return result;
+}
+
+tl::expected<long, ErrorCode> Client::RemoveAllStrict() {
+    if (hot_cache_) hot_cache_->BumpCacheEpoch();
+    auto result = master_client_.RemoveAllStrict();
+    if (result) {
+        if (storage_backend_) storage_backend_->RemoveAll();
+        if (hot_cache_) hot_cache_->RemoveAllHotKeys();
+    }
+    return result;
+}
+
 tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     if (hot_cache_) {
         hot_cache_->BumpCacheEpoch();

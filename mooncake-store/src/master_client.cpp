@@ -138,6 +138,14 @@ struct RpcNameTraits<&WrappedMasterService::Remove> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::RemoveByRegexStrict> {
+    static constexpr const char* value = "RemoveByRegexStrict";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::RemoveAllStrict> {
+    static constexpr const char* value = "RemoveAllStrict";
+};
+template <>
 struct RpcNameTraits<&WrappedMasterService::RemoveByRegex> {
     static constexpr const char* value = "RemoveByRegex";
 };
@@ -857,6 +865,16 @@ tl::expected<long, ErrorCode> MasterClient::RemoveByRegex(
         str, force, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<long, ErrorCode> MasterClient::RemoveByRegexStrict(
+    const std::string& pattern) {
+    return invoke_rpc<&WrappedMasterService::RemoveByRegexStrict, long>(
+        pattern, tenant_id_.value());
+}
+tl::expected<long, ErrorCode> MasterClient::RemoveAllStrict() {
+    return invoke_rpc<&WrappedMasterService::RemoveAllStrict, long>(
+        tenant_id_.value());
 }
 
 tl::expected<long, ErrorCode> MasterClient::RemoveAll(bool force) {

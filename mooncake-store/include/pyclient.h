@@ -508,6 +508,13 @@ class PyClient {
 
     virtual long removeByRegex(const std::string &str, bool force = false) = 0;
 
+    virtual long removeByRegexStrict(const std::string &) {
+        return static_cast<long>(ErrorCode::NOT_SUPPORTED);
+    }
+    virtual long removeAllStrict() {
+        return static_cast<long>(ErrorCode::NOT_SUPPORTED);
+    }
+
     virtual long removeAll(bool force = false) = 0;
 
     virtual std::vector<int> batchRemove(const std::vector<std::string> &keys,
