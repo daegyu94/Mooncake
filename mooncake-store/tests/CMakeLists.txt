@@ -299,6 +299,20 @@ set_tests_properties(dfs_read_checksum_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 if(USE_3FS)
   add_store_test(dfs_hf3fs_test dfs_hf3fs_test.cpp)
+  add_executable(
+    hf3fs_preallocation_test
+    hf3fs_preallocation_test.cpp ../src/types.cpp
+    ../src/storage/distributed/hf3fs_adapter.cpp
+    ../src/hf3fs/hf3fs_resource_manager.cpp)
+  target_include_directories(hf3fs_preallocation_test
+                             PRIVATE ${MOONCAKE_STORE_INCLUDE_ROOT})
+  target_link_libraries(
+    hf3fs_preallocation_test
+    PRIVATE cachelib_memory_allocator yalantinglibs::yalantinglibs glog::glog
+            gtest gtest_main pthread)
+  target_link_options(hf3fs_preallocation_test PRIVATE "-Wl,--wrap=fallocate"
+                      "-Wl,--wrap=ftruncate" "-Wl,--wrap=close")
+  add_test(NAME hf3fs_preallocation_test COMMAND hf3fs_preallocation_test)
 endif()
 add_store_test(
   embedded_snapshot_catalog_store_test
