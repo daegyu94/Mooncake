@@ -2587,6 +2587,11 @@ tl::expected<int64_t, ErrorCode> RealClient::removeAll_internal(bool force) {
     return client_->RemoveAll(force);
 }
 
+int RealClient::invalidateLocalCache(const std::string &pattern) {
+    if (!client_) return static_cast<int>(ErrorCode::INVALID_PARAMS);
+    return to_py_ret(client_->InvalidateLocalCache(pattern));
+}
+
 long RealClient::removeAll(bool force) {
     return to_py_ret(removeAll_internal(force));
 }

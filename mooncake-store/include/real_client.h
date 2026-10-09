@@ -352,6 +352,7 @@ class RealClient : public PyClient {
 
     long removeByRegex(const std::string &str, bool force = false);
 
+    int invalidateLocalCache(const std::string &pattern) override;
     long removeAll(bool force = false);
 
     std::vector<int> batchRemove(const std::vector<std::string> &keys,
