@@ -48,6 +48,7 @@ mount:
 export MOONCAKE_ENABLE_DFS=1
 export MOONCAKE_DFS_ROOT_DIR=/mnt/3fs/mooncake
 export MOONCAKE_DFS_FS_ADAPTER=hf3fs
+export MOONCAKE_DFS_PREALLOCATION_MODE=strict
 export MOONCAKE_DFS_SHARD_COUNT=64
 export MOONCAKE_DFS_SHARD_CAPACITY=4294967296
 export MOONCAKE_DFS_ALIGNMENT=4096
@@ -59,6 +60,8 @@ export MOONCAKE_DFS_SINGLE_TENANT=true
 The master creates and preallocates the configured shard files during startup.
 Ensure the mount is available, writable, and has enough capacity before
 starting the process.
+
+`MOONCAKE_DFS_PREALLOCATION_MODE` is read by the HF3FS adapter at initialization. `strict` requires `fallocate()` to succeed. The default `best_effort` permits `ftruncate()` only when reservation is unsupported (`EOPNOTSUPP` or `ENOSYS`) and logs that only logical length is established. Capacity, quota and I/O errors fail in both modes; a misspelled mode fails initialization. This applies to preallocation calls: existing shard recovery checks logical size and does not prove physical reservation. A successful `fallocate()` has the guarantees of the underlying filesystem.
 
 ### Clients
 

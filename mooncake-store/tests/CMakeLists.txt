@@ -200,15 +200,14 @@ if(USE_TENT)
       --gtest_filter=TransferTaskTest.TransferScatterHandlesFragmentedCpuBuffers
   )
   set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
-                                                           "MC_USE_TENT=1")
+                                                             "MC_USE_TENT=1")
   add_test(
     NAME transfer_submitter_scatter_tent_test
     COMMAND
       transfer_task_test
-      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath
-  )
-  set_tests_properties(transfer_submitter_scatter_tent_test PROPERTIES
-                       ENVIRONMENT "MC_USE_TENT=1")
+      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath)
+  set_tests_properties(transfer_submitter_scatter_tent_test
+                       PROPERTIES ENVIRONMENT "MC_USE_TENT=1")
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
@@ -247,8 +246,10 @@ add_store_test(cxl_segment_config_test cxl_segment_config_test.cpp)
 add_store_test(client_numa_config_test client_numa_config_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
-add_store_test(real_client_hugepage_register_test real_client_hugepage_register_test.cpp)
-add_store_test(real_client_regular_page_register_test real_client_regular_page_register_test.cpp)
+add_store_test(real_client_hugepage_register_test
+               real_client_hugepage_register_test.cpp)
+add_store_test(real_client_regular_page_register_test
+               real_client_regular_page_register_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(standalone_client_test standalone_client_test.cpp)
@@ -299,6 +300,20 @@ set_tests_properties(dfs_read_checksum_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 if(USE_3FS)
   add_store_test(dfs_hf3fs_test dfs_hf3fs_test.cpp)
+  add_executable(
+    hf3fs_preallocation_test
+    hf3fs_preallocation_test.cpp ../src/types.cpp
+    ../src/storage/distributed/hf3fs_adapter.cpp
+    ../src/hf3fs/hf3fs_resource_manager.cpp)
+  target_include_directories(hf3fs_preallocation_test
+                             PRIVATE ${MOONCAKE_STORE_INCLUDE_ROOT})
+  target_link_libraries(
+    hf3fs_preallocation_test
+    PRIVATE cachelib_memory_allocator yalantinglibs::yalantinglibs glog::glog
+            gtest gtest_main pthread)
+  target_link_options(hf3fs_preallocation_test PRIVATE "-Wl,--wrap=fallocate"
+                      "-Wl,--wrap=ftruncate" "-Wl,--wrap=close")
+  add_test(NAME hf3fs_preallocation_test COMMAND hf3fs_preallocation_test)
 endif()
 add_store_test(
   embedded_snapshot_catalog_store_test

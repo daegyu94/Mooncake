@@ -63,6 +63,7 @@ class Hf3fsAdapter : public FileSystemAdapter {
 
    private:
     std::unique_ptr<USRBIOResourceManager> resource_manager_;
+    bool strict_preallocation_ = false;
 };
 
 }  // namespace mooncake
