@@ -347,6 +347,8 @@ class Client {
     tl::expected<long, ErrorCode> RemoveByRegexStrict(
         const std::string& pattern);
     tl::expected<long, ErrorCode> RemoveAllStrict();
+    tl::expected<void, ErrorCode> InvalidateLocalCache(
+        const std::string& pattern);
     tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 
     /**

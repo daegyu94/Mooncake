@@ -514,6 +514,9 @@ class PyClient {
     virtual long removeAllStrict() {
         return static_cast<long>(ErrorCode::NOT_SUPPORTED);
     }
+    virtual int invalidateLocalCache(const std::string &) {
+        return static_cast<int>(ErrorCode::NOT_SUPPORTED);
+    }
 
     virtual long removeAll(bool force = false) = 0;
 

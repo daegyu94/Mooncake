@@ -2596,6 +2596,11 @@ long RealClient::removeAllStrict() {
     return to_py_ret(client_->RemoveAllStrict());
 }
 
+int RealClient::invalidateLocalCache(const std::string &pattern) {
+    if (!client_) return static_cast<int>(ErrorCode::INVALID_PARAMS);
+    return to_py_ret(client_->InvalidateLocalCache(pattern));
+}
+
 long RealClient::removeAll(bool force) {
     return to_py_ret(removeAll_internal(force));
 }

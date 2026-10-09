@@ -2579,6 +2579,14 @@ PYBIND11_MODULE(store, m) {
             "Remove and verify scoped metadata is absent; partial removal "
             "fails.")
         .def(
+            "invalidate_local_cache",
+            [](MooncakeStorePyWrapper &self, const std::string &pattern) {
+                py::gil_scoped_release release;
+                return self.store_->invalidateLocalCache(pattern);
+            },
+            py::arg("regex_pattern"),
+            "Invalidate matching client-local entries without shared deletion.")
+        .def(
             "remove_by_regex",
             [](MooncakeStorePyWrapper &self, const std::string &str,
                bool force) {

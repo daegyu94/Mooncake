@@ -1,4 +1,5 @@
 #include "client_service.h"
+#include <regex>
 
 #include <boost/algorithm/string.hpp>
 #include <glog/logging.h>
@@ -3751,6 +3752,20 @@ tl::expected<long, ErrorCode> Client::RemoveAllStrict() {
         if (hot_cache_) hot_cache_->RemoveAllHotKeys();
     }
     return result;
+}
+
+tl::expected<void, ErrorCode> Client::InvalidateLocalCache(
+    const std::string& pattern) {
+    try {
+        std::regex compiled(pattern);
+    } catch (const std::regex_error&) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (hot_cache_) {
+        hot_cache_->BumpCacheEpoch();
+        hot_cache_->RemoveHotKeysByRegex(pattern);
+    }
+    return {};
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
