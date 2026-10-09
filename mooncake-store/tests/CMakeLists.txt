@@ -529,3 +529,6 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+add_executable(strict_reset_rpc_driver strict_reset_rpc_driver.cpp)
+target_link_libraries(strict_reset_rpc_driver PRIVATE mooncake_store)
