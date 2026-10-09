@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
+#include <limits>
 
 #include <glog/logging.h>
 
@@ -23,6 +25,13 @@ Hf3fsAdapter::Hf3fsAdapter() = default;
 
 tl::expected<void, ErrorCode> Hf3fsAdapter::Init(
     const std::string& mount_path) {
+    const char* mode = std::getenv("MOONCAKE_DFS_PREALLOCATION_MODE");
+    strict_preallocation_ = mode && std::strcmp(mode, "strict") == 0;
+    if (mode && !strict_preallocation_ &&
+        std::strcmp(mode, "best_effort") != 0) {
+        LOG(ERROR) << "Invalid MOONCAKE_DFS_PREALLOCATION_MODE: " << mode;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     resource_manager_ = std::make_unique<USRBIOResourceManager>();
     Hf3fsConfig config{};
     char hf3fs_mount_point[PATH_MAX] = {};
@@ -429,20 +438,32 @@ tl::expected<void, ErrorCode> Hf3fsAdapter::CloseFile(int fd) {
 
 tl::expected<void, ErrorCode> Hf3fsAdapter::PreallocateFile(
     const std::string& path, uint64_t size) {
+    if (size == 0 ||
+        size > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     int fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
 
     int rc = fallocate(fd, 0, 0, static_cast<off_t>(size));
-    if (rc != 0) {
+    int saved_errno = rc == 0 ? 0 : errno;
+    if (rc != 0 && !strict_preallocation_ &&
+        (saved_errno == EOPNOTSUPP || saved_errno == ENOSYS)) {
+        LOG(WARNING) << "DFS reservation unsupported for " << path
+                     << "; best_effort fallback sets logical size only";
         rc = ftruncate(fd, static_cast<off_t>(size));
+        saved_errno = rc == 0 ? 0 : errno;
     }
-    int saved_errno = errno;
-    close(fd);
+    if (close(fd) != 0 && rc == 0) {
+        rc = -1;
+        saved_errno = errno;
+    }
 
     if (rc != 0) {
         errno = saved_errno;
         LOG(ERROR) << "Failed to preallocate DFS file " << path
-                   << ", size=" << size << ", error=" << strerror(errno);
+                   << ", size=" << size << ", error=" << strerror(saved_errno);
+        errno = saved_errno;
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};
