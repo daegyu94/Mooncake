@@ -47,6 +47,12 @@ def main():
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--batch", type=int, default=2048)
     parser.add_argument("--payload", type=int, default=64)
+    parser.add_argument(
+        "--segment-bytes",
+        type=int,
+        default=0,
+        help="Override the client DRAM segment size (0 selects an automatic size)",
+    )
     parser.add_argument("--pending", type=int, nargs="+", default=[0, 32])
     parser.add_argument("--methods", nargs="+", default=["all", "regex"])
     parser.add_argument("--pilot", action="store_true")
@@ -99,7 +105,7 @@ def main():
                     assert time.monotonic() < deadline, "Master readiness timeout"
                     time.sleep(0.1)
             store = sdk.MooncakeDistributedStore()
-            segment_bytes = max(
+            segment_bytes = args.segment_bytes or max(
                 512 * 1024**2, max(args.entries) * max(64, args.payload) * 4
             )
             assert (
