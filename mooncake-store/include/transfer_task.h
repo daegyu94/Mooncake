@@ -129,6 +129,9 @@ class OperationState {
      */
     virtual void wait_for_completion() = 0;
 
+    // Completion may report a timeout before the transport stops touching data.
+    virtual void drain() { wait_for_completion(); }
+
    protected:
     std::optional<ErrorCode> result_ = std::nullopt;
     mutable std::mutex mutex_;
@@ -251,6 +254,8 @@ class TransferEngineOperationState : public OperationState {
     bool is_completed() override;
 
     void wait_for_completion() override;
+    void drain() override;
+    void drain_after_submit_failure();
 
     TransferStrategy get_strategy() const override {
         return TransferStrategy::TRANSFER_ENGINE;
@@ -265,6 +270,7 @@ class TransferEngineOperationState : public OperationState {
     void check_task_status();
 
     void set_result_internal(ErrorCode error_code);
+    void drain_batch(bool submission_failed);
 
     TransferEngine& engine_;
     mooncake::tent::TransferEngine* tent_engine_;
@@ -315,6 +321,8 @@ class TransferFuture {
     TransferStrategy strategy() const;
 
    private:
+    void drain() { state_->drain(); }
+    friend class Client;
     std::shared_ptr<OperationState> state_;
 };
 

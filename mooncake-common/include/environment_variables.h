@@ -209,6 +209,8 @@ struct MasterMetadataEnvironmentVariables {
 };
 
 struct TransferSubmitterEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MC_STORE_PARALLEL_DFS_PUT);
+    MC_DEFINE_ENV_VAR(bool, MC_STORE_DFS_WRITE_FENCING);
     // Keep the raw string to preserve the legacy token set, whitespace,
     // invalid-value fallback, and warning behavior.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_MEMCPY);

@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <future>
+#include "transport/transport.h"
 #include <numeric>
 #include <stdexcept>
 #include <thread>
@@ -103,6 +105,40 @@ TEST(TransferScatterApiTest, SubmitterOwnsScatterOperation) {
                 std::declval<const ScatterRanges&>(),
                 TransferIntent::kForegroundGet)),
             StoreScatterTransferOperation>);
+}
+
+TEST_F(TransferTaskTest, DrainWaitsForAllTasksAndCompletionCallbacks) {
+    TransferEngine engine;
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17940"), 0);
+    const auto batch_id = engine.allocateBatchID(2);
+    ASSERT_NE(batch_id, INVALID_BATCH_ID);
+    auto& batch = Transport::toBatchDesc(batch_id);
+    batch.task_list.resize(2);
+    for (auto& task : batch.task_list) task.slice_count = 1;
+    batch.task_list[0].failed_slice_count = 1;
+    batch.task_list[0].is_finished = true;
+    batch.active_completion_callbacks = 1;
+    TransferEngineOperationState state(engine, batch_id, 2);
+    auto drained = std::async(std::launch::async, [&] { state.drain(); });
+    EXPECT_EQ(drained.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    __atomic_store_n(&batch.task_list[1].success_slice_count, uint64_t{1},
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&batch.task_list[1].is_finished, true, __ATOMIC_RELEASE);
+    EXPECT_EQ(drained.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    batch.active_completion_callbacks.store(0, std::memory_order_release);
+    drained.get();
+}
+
+TEST_F(TransferTaskTest, FailedSubmissionDrainsUnpostedTasks) {
+    TransferEngine engine;
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17941"), 0);
+    const auto batch_id = engine.allocateBatchID(1);
+    ASSERT_NE(batch_id, INVALID_BATCH_ID);
+    Transport::toBatchDesc(batch_id).task_list.resize(1);
+    TransferEngineOperationState state(engine, batch_id, 1);
+    state.drain_after_submit_failure();
 }
 
 // Test MemcpyOperationState functionality

@@ -13,6 +13,9 @@ namespace mooncake {
 
 TransferSubmitterConfig TransferSubmitterConfig::FromEnvironment() {
     TransferSubmitterConfig config;
+    config.parallel_dfs_put = Environ::ReadOr(
+        TransferSubmitterEnvironmentVariables::MC_STORE_PARALLEL_DFS_PUT,
+        false);
     auto value =
         Environ::Read(TransferSubmitterEnvironmentVariables::MC_STORE_MEMCPY);
     if (!value.has_value()) {

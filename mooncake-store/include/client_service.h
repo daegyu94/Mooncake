@@ -982,7 +982,14 @@ class Client {
     void StageWriteBuffersForRemoteReplicas(std::vector<PutOperation>& ops,
                                             const WriteBufferStager& stager);
     void SubmitTransfers(std::vector<PutOperation>& ops);
-    void WaitForTransfers(std::vector<PutOperation>& ops);
+    void WaitForTransfers(std::vector<PutOperation>& ops, bool drain = false);
+    bool ShouldOverlapDfs(const std::vector<PutOperation>& ops) const;
+    void TransferAndWriteDfs(std::vector<PutOperation>& ops);
+    std::vector<std::optional<ErrorCode>> CollectDfsWriteResults(
+        std::vector<PutOperation>& ops, bool allow_pending);
+    void ApplyDfsWriteResults(
+        std::vector<PutOperation>& ops,
+        const std::vector<std::optional<ErrorCode>>& results);
     void SubmitDfsWrites(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
@@ -1052,6 +1059,9 @@ class Client {
     // Client persistent thread pool for async operations
     // Pinned host memory pool for GPU D2H staging (must outlive
     // write_thread_pool_)
+    const bool parallel_dfs_put_;
+    const bool fenced_dfs_writes_;
+    std::atomic<uint64_t> next_dfs_write_sequence_{1};
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;

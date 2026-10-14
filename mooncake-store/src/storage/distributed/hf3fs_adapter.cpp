@@ -9,12 +9,32 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <chrono>
+#include <thread>
+#include <mutex>
+#include <limits>
 
 #include <glog/logging.h>
 
 #include "hf3fs/hf3fs.h"
 
 namespace mooncake {
+namespace {
+// A submit notification/wait failure does not cancel already published I/O.
+// Keep the ring and Iov alive until its exact completion has been consumed.
+bool ReapPreparedIo(hf3fs_ior& ior, int index, const void* userdata,
+                    bool failed, hf3fs_cqe& cqe) {
+    while (true) {
+        const int count = hf3fs_wait_for_ios(&ior, &cqe, 1, 1, nullptr);
+        if (count == -EINTR || count == -EAGAIN || count == 0) continue;
+        if (count == 1 && cqe.index == index && cqe.userdata == userdata)
+            return !failed;
+        if (!failed) LOG(ERROR) << "Failed to reap prepared DFS I/O";
+        failed = true;
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+}
+}  // namespace
 
 // Destructor must be defined in .cpp where USRBIOResourceManager is complete.
 Hf3fsAdapter::~Hf3fsAdapter() = default;
@@ -23,6 +43,7 @@ Hf3fsAdapter::Hf3fsAdapter() = default;
 
 tl::expected<void, ErrorCode> Hf3fsAdapter::Init(
     const std::string& mount_path) {
+    std::unique_lock lock(lifecycle_mutex_);
     resource_manager_ = std::make_unique<USRBIOResourceManager>();
     Hf3fsConfig config{};
     char hf3fs_mount_point[PATH_MAX] = {};
@@ -38,6 +59,7 @@ tl::expected<void, ErrorCode> Hf3fsAdapter::Init(
 }
 
 tl::expected<void, ErrorCode> Hf3fsAdapter::Shutdown() {
+    std::unique_lock lock(lifecycle_mutex_);
     resource_manager_.reset();
     return {};
 }
@@ -166,13 +188,22 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteAt(int fd, const iovec* iov,
         }
     }
 
+    std::shared_lock lock(lifecycle_mutex_);
+    if (!resource_manager_)
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     auto* resource = resource_manager_->getThreadResource();
     if (!resource || !resource->initialized) {
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
     size_t total_length = 0;
-    for (int i = 0; i < iovcnt; ++i) total_length += iov[i].iov_len;
+    for (int i = 0; i < iovcnt; ++i) {
+        if (iov[i].iov_len >
+            std::numeric_limits<size_t>::max() - total_length) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        total_length += iov[i].iov_len;
+    }
     if (total_length == 0) return size_t{0};
 
     auto& threefs_iov = resource->iov_;
@@ -201,18 +232,19 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteAt(int fd, const iovec* iov,
         }
         if (copied == 0) break;
 
-        int ret =
+        const int prepared =
             hf3fs_prep_io(&ior_write, &threefs_iov, false, threefs_iov.base, fd,
-                          current_offset, copied, nullptr);
-        if (ret < 0) break;
-        ret = hf3fs_submit_ios(&ior_write);
-        if (ret < 0) break;
-        struct hf3fs_cqe cqe;
-        ret = hf3fs_wait_for_ios(&ior_write, &cqe, 1, 1, nullptr);
-        if (ret < 0 || cqe.result < 0) break;
+                          current_offset, copied, &copied);
+        if (prepared < 0) break;
+        // prep_io publishes the request even if the submit notification fails.
+        bool failed = hf3fs_submit_ios(&ior_write) < 0;
+        struct hf3fs_cqe cqe{};
+        failed = !ReapPreparedIo(ior_write, prepared, &copied, failed, cqe);
+        if (failed || cqe.result <= 0 ||
+            static_cast<uint64_t>(cqe.result) > copied)
+            break;
 
-        size_t bytes_written = cqe.result;
-        if (bytes_written == 0) break;
+        size_t bytes_written = static_cast<size_t>(cqe.result);
         total_written += bytes_written;
         current_offset += bytes_written;
         remaining -= bytes_written;
@@ -237,13 +269,22 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::ReadAt(int fd, iovec* iov,
         }
     }
 
+    std::shared_lock lock(lifecycle_mutex_);
+    if (!resource_manager_)
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     auto* resource = resource_manager_->getThreadResource();
     if (!resource || !resource->initialized) {
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
     size_t total_length = 0;
-    for (int i = 0; i < iovcnt; ++i) total_length += iov[i].iov_len;
+    for (int i = 0; i < iovcnt; ++i) {
+        if (iov[i].iov_len >
+            std::numeric_limits<size_t>::max() - total_length) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        total_length += iov[i].iov_len;
+    }
     if (total_length == 0) return size_t{0};
 
     auto& threefs_iov = resource->iov_;
@@ -256,17 +297,18 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::ReadAt(int fd, iovec* iov,
 
     while (remaining > 0) {
         size_t chunk = std::min(remaining, resource->config_.iov_size);
-        int ret = hf3fs_prep_io(&ior_read, &threefs_iov, true, threefs_iov.base,
-                                fd, current_offset, chunk, nullptr);
-        if (ret < 0) break;
-        ret = hf3fs_submit_ios(&ior_read);
-        if (ret < 0) break;
-        struct hf3fs_cqe cqe;
-        ret = hf3fs_wait_for_ios(&ior_read, &cqe, 1, 1, nullptr);
-        if (ret < 0 || cqe.result < 0) break;
-
-        size_t bytes_read = cqe.result;
-        if (bytes_read == 0) break;
+        const int prepared =
+            hf3fs_prep_io(&ior_read, &threefs_iov, true, threefs_iov.base, fd,
+                          current_offset, chunk, &chunk);
+        if (prepared < 0) break;
+        const bool submit_failed = hf3fs_submit_ios(&ior_read) < 0;
+        struct hf3fs_cqe cqe{};
+        const bool success =
+            ReapPreparedIo(ior_read, prepared, &chunk, submit_failed, cqe);
+        if (!success || cqe.result <= 0 ||
+            static_cast<uint64_t>(cqe.result) > chunk)
+            break;
+        size_t bytes_read = static_cast<size_t>(cqe.result);
 
         size_t to_copy = bytes_read;
         char* src = reinterpret_cast<char*>(threefs_iov.base);

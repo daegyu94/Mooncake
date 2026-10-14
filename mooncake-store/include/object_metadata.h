@@ -97,6 +97,9 @@ struct ObjectMetadata {
 
     // Updated by UpsertStart (Case B) to reflect the new writer.
     UUID client_id;
+    // Runtime-only: DFS snapshot/HA restore is unsupported.
+    std::optional<UUID> write_attempt;
+    bool fenced_write_active = false;
     // Updated by UpsertStart (Case B) to reset the discard timeout.
     std::chrono::system_clock::time_point put_start_time;
     const size_t size;

@@ -1,3 +1,4 @@
+#include <limits>
 #include "master_client.h"
 
 #include <async_simple/coro/FutureAwaiter.h>
@@ -21,6 +22,21 @@ namespace mooncake {
 
 template <auto Method>
 struct RpcNameTraits;
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchRevokeFencedDfsWrite> {
+    static constexpr const char* value = "BatchRevokeFencedDfsWrite";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchEndFencedDfsWrite> {
+    static constexpr const char* value = "BatchEndFencedDfsWrite";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchStartFencedDfsWrite> {
+    static constexpr const char* value = "BatchStartFencedDfsWrite";
+};
 
 template <>
 struct RpcNameTraits<&WrappedMasterService::ExistKey> {
@@ -705,6 +721,47 @@ MasterClient::BatchPutStart(
         tenant_id_.value());
     timer.LogResponse("result=", result.size(), " operations");
     return result;
+}
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+MasterClient::BatchStartFencedDfsWrite(
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<uint64_t>>& lengths,
+    const ReplicateConfig& config, const UUID& attempt, bool upsert) {
+    std::vector<uint64_t> totals;
+    totals.reserve(lengths.size());
+    for (const auto& slices : lengths) {
+        uint64_t total = 0;
+        for (uint64_t size : slices) {
+            if (size > std::numeric_limits<uint64_t>::max() - total) {
+                return std::vector<
+                    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
+                    keys.size(),
+                    tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            }
+            total += size;
+        }
+        totals.push_back(total);
+    }
+    return invoke_batch_rpc<&WrappedMasterService::BatchStartFencedDfsWrite,
+                            std::vector<Replica::Descriptor>>(
+        keys.size(), client_id_, keys, totals, config, attempt, upsert,
+        tenant_id_.value());
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEndFencedDfsWrite(
+    const std::vector<ObjectMeta>& objects, const UUID& attempt) {
+    return invoke_batch_rpc<&WrappedMasterService::BatchEndFencedDfsWrite,
+                            void>(objects.size(), client_id_, objects, attempt,
+                                  tenant_id_.value());
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+MasterClient::BatchRevokeFencedDfsWrite(const std::vector<std::string>& keys,
+                                        const UUID& attempt) {
+    return invoke_batch_rpc<&WrappedMasterService::BatchRevokeFencedDfsWrite,
+                            void>(keys.size(), client_id_, keys, attempt,
+                                  tenant_id_.value());
 }
 
 tl::expected<void, ErrorCode> MasterClient::PutEnd(

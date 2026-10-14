@@ -1,3 +1,6 @@
+#include <fcntl.h>
+#include <unistd.h>
+#include "config/dfs_write_fencing_config.h"
 #include "master_service.h"
 
 #include <algorithm>
@@ -508,6 +511,42 @@ void MasterService::InitDfsAllocatorFromEnvironment(
     }
 
     const auto dfs_config = DistributedStorageConfig::FromEnvironment();
+    const auto epoch_path =
+        std::filesystem::path(dfs_config.fsdir) / kFencedDfsEpochFile;
+    if (std::filesystem::exists(epoch_path)) {
+        throw std::invalid_argument(
+            "Fenced DFS root requires a fresh namespace after restart");
+    }
+    fenced_dfs_writes_ = DfsWriteFencingConfig::Enabled();
+    if (fenced_dfs_writes_) {
+        if (config.enable_ha || !config.root_fs_dir.empty()) {
+            throw std::invalid_argument(
+                "Fenced DFS writes do not support HA or legacy DISK");
+        }
+        std::filesystem::create_directories(dfs_config.fsdir);
+        if (!std::filesystem::is_empty(dfs_config.fsdir)) {
+            throw std::invalid_argument(
+                "Fenced DFS writes require an empty root");
+        }
+        const int fd = ::open(epoch_path.c_str(),
+                              O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+        if (fd < 0)
+            throw std::runtime_error("Cannot seal fenced DFS namespace");
+        constexpr char marker[] = "fenced-dfs-writes-v1\n";
+        const bool written =
+            ::write(fd, marker, sizeof(marker) - 1) == sizeof(marker) - 1;
+        const bool synced = ::fsync(fd) == 0;
+        ::close(fd);
+        const int directory = ::open(dfs_config.fsdir.c_str(),
+                                     O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        const bool directory_synced = directory >= 0 && ::fsync(directory) == 0;
+        if (directory >= 0) ::close(directory);
+        if (!written || !synced || !directory_synced) {
+            throw std::runtime_error(
+                "Cannot persist fenced DFS namespace seal");
+        }
+    }
+
     if (!dfs_config.single_tenant) {
         LOG(ERROR) << "Currently, DFS backend is not supported in "
                       "multi-tenant mode";
@@ -1625,6 +1664,7 @@ void MasterService::RebuildCacheTotalAccounting() {
 std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata,
     const std::function<bool(const Replica&)>& pred_fn) {
+    if (metadata.fenced_write_active) return {};
     auto replicas = metadata.PopReplicas(pred_fn);
     SyncCacheTotalAccounting(metadata);
     return replicas;
@@ -1632,6 +1672,7 @@ std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
 
 std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata) {
+    if (metadata.fenced_write_active) return {};
     auto replicas = metadata.PopReplicas();
     SyncCacheTotalAccounting(metadata);
     return replicas;
@@ -2025,6 +2066,7 @@ MasterService::ObjectMap::iterator MasterService::EraseMetadata(
     MetadataShardAccessorRW* shard,
     const std::vector<std::string>& previous_media_hint) {
     auto& metadata = it->second.metadata;
+    if (metadata.fenced_write_active) return std::next(it);
     auto& state = it->second.state;
     bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
         return r.is_local_disk_replica() && r.is_completed();
@@ -4426,6 +4468,7 @@ auto MasterService::BatchReplicaClear(
         }
 
         auto& metadata = accessor.Get();
+        if (metadata.fenced_write_active) continue;
         const auto previous_kv_media = KvMediaSnapshot(metadata);
 
         // Security check: Ensure the requesting client owns the object.
@@ -5268,7 +5311,8 @@ auto MasterService::InsertMetadata(
     const ResolvedSoftPinRequest& soft_pin_request,
     std::vector<Replica>&& replicas, uint64_t pending_quota_charge,
     std::optional<std::chrono::system_clock::time_point>
-        committed_soft_pin_timeout)
+        committed_soft_pin_timeout,
+    const std::optional<UUID>& write_attempt)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     const auto deadline_to_index = committed_soft_pin_timeout;
     auto& tenant_state = GetOrCreateTenantState(shard.get(), tenant_id);
@@ -5345,6 +5389,12 @@ auto MasterService::InsertMetadata(
             RegisterGroupMember(tenant_id, key, group_id);
     }
     it->second.state.is_processing = true;
+    it->second.metadata.write_attempt = write_attempt;
+    it->second.metadata.fenced_write_active = write_attempt.has_value();
+    if (write_attempt) {
+        fenced_write_watermarks_[getShardIndex(tenant_id, key)]
+                                [{key, client_id}] = write_attempt->first;
+    }
 
     return replica_list;
 }
@@ -5358,7 +5408,7 @@ auto MasterService::AllocateAndInsertMetadata(
     const ResolvedSoftPinRequest& soft_pin_request,
     std::optional<std::chrono::system_clock::time_point>
         committed_soft_pin_timeout,
-    bool* dfs_allocation_failed)
+    bool* dfs_allocation_failed, const std::optional<UUID>& write_attempt)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     auto& tenant_state = GetOrCreateTenantState(shard.get(), tenant_id);
     if (tenant_state.metadata.contains(key)) {
@@ -5384,7 +5434,8 @@ auto MasterService::AllocateAndInsertMetadata(
     auto insert_result = InsertMetadata(
         shard, client_id, key, value_length, config, group_id, tenant_id, now,
         soft_pin_request, std::move(allocation_result.value()),
-        pending_quota_charge, std::move(committed_soft_pin_timeout));
+        pending_quota_charge, std::move(committed_soft_pin_timeout),
+        write_attempt);
     if (!insert_result) {
         ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
                            pending_quota_charge);
@@ -5392,11 +5443,96 @@ auto MasterService::AllocateAndInsertMetadata(
     return insert_result;
 }
 
+auto MasterService::CheckFencedWriteHistory(
+    TenantState& tenant, size_t shard_index, const UUID& client_id,
+    const std::string& key, uint64_t length, const ReplicateConfig& config,
+    const std::optional<UUID>& attempt)
+    -> tl::expected<std::optional<std::vector<Replica::Descriptor>>,
+                    ErrorCode> {
+    if (!attempt) return std::optional<std::vector<Replica::Descriptor>>{};
+    auto& history = fenced_write_watermarks_[shard_index];
+    const auto watermark = history.find({key, client_id});
+    if (watermark == history.end()) {
+        if (history.size() >= kMaxFencedWriteHistoryPerShard) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        return std::optional<std::vector<Replica::Descriptor>>{};
+    }
+    if (attempt->first > watermark->second) {
+        return std::optional<std::vector<Replica::Descriptor>>{};
+    }
+    const auto current = tenant.metadata.find(key);
+    if (current == tenant.metadata.end())
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    auto& metadata = current->second.metadata;
+    if (!metadata.fenced_write_active || metadata.client_id != client_id ||
+        metadata.write_attempt != attempt || metadata.size != length ||
+        metadata.CountReplicas(&Replica::fn_is_memory_replica) !=
+            config.replica_num ||
+        metadata.CountReplicas(&Replica::fn_is_nof_replica) !=
+            config.nof_replica_num ||
+        metadata.CountReplicas(&Replica::fn_is_dfs_replica) !=
+            config.dfs_replica_num) {
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+    std::vector<Replica::Descriptor> descriptors;
+    for (const auto& replica : metadata.GetAllReplicas())
+        descriptors.push_back(replica.get_descriptor());
+    return std::optional<std::vector<Replica::Descriptor>>(
+        std::move(descriptors));
+}
+
+auto MasterService::StartFencedDfsWrite(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    uint64_t length, const ReplicateConfig& config, const UUID& attempt,
+    bool upsert) -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    if (!fenced_dfs_writes_ || config.dfs_replica_num != 1) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    if (attempt.first == 0)
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    return upsert ? UpsertStartImpl(client_id, key, tenant_id, length, config,
+                                    attempt)
+                  : PutStartImpl(client_id, key, tenant_id, length, config,
+                                 attempt);
+}
+
+auto MasterService::EndFencedDfsWrite(const UUID& client_id,
+                                      const ObjectMeta& object_meta,
+                                      const TenantId& tenant_id,
+                                      const UUID& attempt)
+    -> tl::expected<void, ErrorCode> {
+    return PutEndImpl(client_id, object_meta, tenant_id, ReplicaType::ALL,
+                      attempt);
+}
+
+auto MasterService::RevokeFencedDfsWrite(const UUID& client_id,
+                                         const std::string& key,
+                                         const TenantId& tenant_id,
+                                         const UUID& attempt)
+    -> tl::expected<void, ErrorCode> {
+    return PutRevokeImpl(client_id, key, tenant_id, ReplicaType::ALL, attempt);
+}
+
 auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const TenantId& tenant_id,
                              const uint64_t slice_length,
                              const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    return PutStartImpl(client_id, key, tenant_id, slice_length, config,
+                        std::nullopt);
+}
+
+auto MasterService::PutStartImpl(const UUID& client_id, const std::string& key,
+                                 const TenantId& tenant_id,
+                                 const uint64_t slice_length,
+                                 const ReplicateConfig& config,
+                                 const std::optional<UUID>& write_attempt)
+    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    if (config.dfs_replica_num > 0 &&
+        fenced_dfs_writes_ != write_attempt.has_value()) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
          config.dfs_replica_num == 0) ||
@@ -5502,6 +5638,12 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 return tl::make_unexpected(admission_result.error());
             }
 
+            auto replay = CheckFencedWriteHistory(
+                tenant_state, getShardIndex(object_id.tenant_id, key),
+                client_id, key, slice_length, config, write_attempt);
+            if (!replay) return tl::make_unexpected(replay.error());
+            if (*replay) return std::move(**replay);
+
             auto it = tenant_state.metadata.find(key);
             if (it != tenant_state.metadata.end()) {
                 auto cleanup_plan = BuildStaleHandleCleanupPlan(
@@ -5526,6 +5668,11 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 }
                 if (it != tenant_state.metadata.end()) {
                     auto& metadata = it->second.metadata;
+                    if (metadata.write_attempt.has_value() &&
+                        it->second.state.is_processing) {
+                        return tl::make_unexpected(
+                            ErrorCode::OBJECT_REPLICA_BUSY);
+                    }
                     if (metadata.HasReplica(&Replica::fn_is_completed) ||
                         metadata.put_start_time +
                                 put_start_discard_timeout_sec_ >=
@@ -5561,7 +5708,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 return AllocateAndInsertMetadata(
                     shard, client_id, key, slice_length, config, writer_host_id,
                     group_id, object_id.tenant_id, now, *soft_pin_request,
-                    std::nullopt, &dfs_allocation_failed);
+                    std::nullopt, &dfs_allocation_failed, write_attempt);
             }
             // Logically unreachable: the object-exists paths above always
             // return or erase the entry. Kept for -Wreturn-type.
@@ -5596,6 +5743,16 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    return PutEndImpl(client_id, object_meta, tenant_id, replica_type,
+                      std::nullopt);
+}
+
+auto MasterService::PutEndImpl(const UUID& client_id,
+                               const ObjectMeta& object_meta,
+                               const TenantId& tenant_id,
+                               ReplicaType replica_type,
+                               const std::optional<UUID>& write_attempt)
+    -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -5606,6 +5763,10 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     }
 
     auto& metadata = accessor.Get();
+    if (metadata.write_attempt != write_attempt) {
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
     if (client_id != metadata.client_id) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutEnd key " << key
                    << ", was PutStart-ed by " << metadata.client_id;
@@ -5675,6 +5836,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         }
     }
 
+    metadata.fenced_write_active = false;
     const bool had_completed_replica =
         metadata.HasReplica(&Replica::fn_is_completed);
     bool completed_pending_replica = false;
@@ -5901,6 +6063,14 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    return PutRevokeImpl(client_id, key, tenant_id, replica_type, std::nullopt);
+}
+
+auto MasterService::PutRevokeImpl(const UUID& client_id, const std::string& key,
+                                  const TenantId& tenant_id,
+                                  ReplicaType replica_type,
+                                  const std::optional<UUID>& write_attempt)
+    -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -5910,6 +6080,10 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     auto& metadata = accessor.Get();
+    if (metadata.write_attempt != write_attempt) {
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
     const auto previous_kv_media = KvMediaSnapshot(metadata);
     if (client_id != metadata.client_id) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutRevoke key "
@@ -5990,6 +6164,9 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return {};
     }
 
+    // A matching Revoke is the client acknowledgement that submitted I/O
+    // has drained; other removal paths may not retire an active attempt.
+    metadata.fenced_write_active = false;
     const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
     EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
     metadata.ClearPendingSoftPinIfNoViableReplica();
@@ -6079,6 +6256,21 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 const uint64_t slice_length,
                                 const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    return UpsertStartImpl(client_id, key, tenant_id, slice_length, config,
+                           std::nullopt);
+}
+
+auto MasterService::UpsertStartImpl(const UUID& client_id,
+                                    const std::string& key,
+                                    const TenantId& tenant_id,
+                                    const uint64_t slice_length,
+                                    const ReplicateConfig& config,
+                                    const std::optional<UUID>& write_attempt)
+    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    if (config.dfs_replica_num > 0 &&
+        fenced_dfs_writes_ != write_attempt.has_value()) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     // --- Parameter validation (same as PutStart) ---
     if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
@@ -6192,6 +6384,12 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 return tl::make_unexpected(admission_result.error());
             }
 
+            auto replay = CheckFencedWriteHistory(
+                tenant_state, getShardIndex(object_id.tenant_id, key),
+                client_id, key, slice_length, config, write_attempt);
+            if (!replay) return tl::make_unexpected(replay.error());
+            if (*replay) return std::move(**replay);
+
             auto it = tenant_state.metadata.find(key);
 
             // --- Step 0: stale handle cleanup ---
@@ -6218,6 +6416,12 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         it = tenant_state.metadata.end();
                     }
                 }
+            }
+
+            if (it != tenant_state.metadata.end() &&
+                it->second.state.is_processing &&
+                it->second.metadata.write_attempt.has_value()) {
+                return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
             }
 
             // --- Step 1: safety checks and preemption (only if key exists) ---
@@ -6329,7 +6533,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     writer_host_id, allocation_group_id, object_id.tenant_id,
                     now, *soft_pin_request,
                     allocation_committed_soft_pin_timeout,
-                    &dfs_allocation_failed);
+                    &dfs_allocation_failed, write_attempt);
             } else {
                 // --- Step 2: key exists with COMPLETE replicas → Case B or C
                 // ---
@@ -6398,6 +6602,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 if (metadata.size == slice_length && !has_read_lease &&
                     !has_bucket_dfs_replica && !restore_missing_bucket_dfs) {
                     metadata.client_id = client_id;
+                    metadata.write_attempt = write_attempt;
+                    metadata.fenced_write_active = write_attempt.has_value();
+                    if (write_attempt) {
+                        fenced_write_watermarks_[getShardIndex(
+                            object_id.tenant_id, key)][{key, client_id}] =
+                            write_attempt->first;
+                    }
                     metadata.put_start_time = now;
 
                     const auto previous_kv_media = KvMediaSnapshot(metadata);
@@ -6538,14 +6749,15 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                   object_id.tenant_id, now, *soft_pin_request,
                                   std::move(*replacement_replicas),
                                   replacement_pending_quota_charge,
-                                  allocation_committed_soft_pin_timeout)
+                                  allocation_committed_soft_pin_timeout,
+                                  write_attempt)
                             : AllocateAndInsertMetadata(
                                   shard, client_id, key, slice_length,
                                   allocation_config, writer_host_id,
                                   allocation_group_id, object_id.tenant_id, now,
                                   *soft_pin_request,
                                   allocation_committed_soft_pin_timeout,
-                                  &dfs_allocation_failed);
+                                  &dfs_allocation_failed, write_attempt);
                 if (!allocate_result) {
                     if (replacement_replicas.has_value()) {
                         ReleaseTenantQuota(quota_account,
@@ -10539,6 +10751,11 @@ void MasterService::DiscardExpiredProcessingReplicas(
                         it->second.state.is_processing = false;
                     }
                 }
+                continue;
+            }
+
+            if (metadata.fenced_write_active) {
+                ++it;
                 continue;
             }
 

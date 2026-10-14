@@ -495,6 +495,76 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+WrappedMasterService::BatchStartFencedDfsWrite(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<uint64_t>& lengths, const ReplicateConfig& config,
+    const UUID& attempt, bool upsert, const std::string& tenant_id) {
+    if (keys.size() != lengths.size() ||
+        (config.group_ids && config.group_ids->size() != keys.size())) {
+        return std::vector<
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    return WithRequestTenantBatch(
+        tenant_id, keys.size(), [&](const TenantId& tenant) {
+            std::vector<
+                tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+                results;
+            results.reserve(keys.size());
+            auto placement = config;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                results.push_back(master_service_.StartFencedDfsWrite(
+                    client_id, keys[i], tenant, lengths[i],
+                    placement.ForSingleKey(i), attempt, upsert));
+                if (i == 0 && results.back() &&
+                    config.prefer_alloc_in_same_node) {
+                    for (const auto& replica : *results.back()) {
+                        if (replica.is_memory_replica()) {
+                            placement.preferred_segment =
+                                replica.get_memory_descriptor()
+                                    .buffer_descriptor.transport_endpoint_;
+                            break;
+                        }
+                    }
+                }
+            }
+            return results;
+        });
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchEndFencedDfsWrite(
+    const UUID& client_id, const std::vector<ObjectMeta>& objects,
+    const UUID& attempt, const std::string& tenant_id) {
+    return WithRequestTenantBatch(
+        tenant_id, objects.size(), [&](const TenantId& tenant) {
+            std::vector<tl::expected<void, ErrorCode>> results;
+            results.reserve(objects.size());
+            for (const auto& object : objects) {
+                results.push_back(master_service_.EndFencedDfsWrite(
+                    client_id, object, tenant, attempt));
+            }
+            return results;
+        });
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchRevokeFencedDfsWrite(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const UUID& attempt, const std::string& tenant_id) {
+    return WithRequestTenantBatch(
+        tenant_id, keys.size(), [&](const TenantId& tenant) {
+            std::vector<tl::expected<void, ErrorCode>> results;
+            results.reserve(keys.size());
+            for (const auto& key : keys) {
+                results.push_back(master_service_.RevokeFencedDfsWrite(
+                    client_id, key, tenant, attempt));
+            }
+            return results;
+        });
+}
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 WrappedMasterService::BatchPutStart(const UUID& client_id,
                                     const std::vector<std::string>& keys,
                                     const std::vector<uint64_t>& slice_lengths,
@@ -1881,6 +1951,15 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutRevoke>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchStartFencedDfsWrite>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchEndFencedDfsWrite>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchRevokeFencedDfsWrite>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchPutStart>(
         &wrapped_master_service);

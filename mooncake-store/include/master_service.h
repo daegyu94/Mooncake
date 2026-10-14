@@ -435,6 +435,18 @@ class MasterService {
      *         ErrorCode::NO_AVAILABLE_HANDLE if allocation fails,
      *         ErrorCode::INVALID_PARAMS if slice size is invalid
      */
+    auto StartFencedDfsWrite(const UUID& client_id, const std::string& key,
+                             const TenantId& tenant_id, uint64_t length,
+                             const ReplicateConfig& config, const UUID& attempt,
+                             bool upsert)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    auto EndFencedDfsWrite(const UUID& client_id, const ObjectMeta& object_meta,
+                           const TenantId& tenant_id, const UUID& attempt)
+        -> tl::expected<void, ErrorCode>;
+    auto RevokeFencedDfsWrite(const UUID& client_id, const std::string& key,
+                              const TenantId& tenant_id, const UUID& attempt)
+        -> tl::expected<void, ErrorCode>;
+
     auto PutStart(const UUID& client_id, const std::string& key,
                   const TenantId& tenant_id, const uint64_t slice_length,
                   const ReplicateConfig& config)
@@ -1522,6 +1534,33 @@ class MasterService {
                           bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
+    auto PutStartImpl(const UUID&, const std::string&, const TenantId&,
+                      uint64_t, const ReplicateConfig&,
+                      const std::optional<UUID>&)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    auto UpsertStartImpl(const UUID&, const std::string&, const TenantId&,
+                         uint64_t, const ReplicateConfig&,
+                         const std::optional<UUID>&)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    auto PutEndImpl(const UUID&, const ObjectMeta&, const TenantId&,
+                    ReplicaType, const std::optional<UUID>&)
+        -> tl::expected<void, ErrorCode>;
+    auto PutRevokeImpl(const UUID&, const std::string&, const TenantId&,
+                       ReplicaType, const std::optional<UUID>&)
+        -> tl::expected<void, ErrorCode>;
+    auto CheckFencedWriteHistory(TenantState& tenant, size_t shard_index,
+                                 const UUID& client_id, const std::string& key,
+                                 uint64_t length, const ReplicateConfig& config,
+                                 const std::optional<UUID>& attempt)
+        -> tl::expected<std::optional<std::vector<Replica::Descriptor>>,
+                        ErrorCode>;
+    bool fenced_dfs_writes_ = false;
+    // Guarded by the corresponding metadata shard. Retain watermarks after
+    // key deletion so an old Start cannot reopen a retired attempt.
+    static constexpr size_t kMaxFencedWriteHistoryPerShard = 4096;
+    std::array<std::map<std::pair<std::string, UUID>, uint64_t>, kNumShards>
+        fenced_write_watermarks_;
+
     auto InsertMetadata(MetadataShardAccessorRW& shard, const UUID& client_id,
                         const std::string& key, uint64_t value_length,
                         const ReplicateConfig& config,
@@ -1531,7 +1570,8 @@ class MasterService {
                         std::vector<Replica>&& replicas,
                         uint64_t pending_quota_charge,
                         std::optional<std::chrono::system_clock::time_point>
-                            committed_soft_pin_timeout = std::nullopt)
+                            committed_soft_pin_timeout = std::nullopt,
+                        const std::optional<UUID>& write_attempt = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
@@ -1545,7 +1585,8 @@ class MasterService {
         const ResolvedSoftPinRequest& soft_pin_request,
         std::optional<std::chrono::system_clock::time_point>
             committed_soft_pin_timeout = std::nullopt,
-        bool* dfs_allocation_failed = nullptr)
+        bool* dfs_allocation_failed = nullptr,
+        const std::optional<UUID>& write_attempt = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**

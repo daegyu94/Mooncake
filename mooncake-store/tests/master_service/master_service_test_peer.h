@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "master_service.h"
+#include "rpc_service.h"
 
 namespace mooncake::test {
 
@@ -14,6 +15,27 @@ class MasterServiceTestPeer {
    public:
     explicit MasterServiceTestPeer(MasterService& service)
         : service_(service) {}
+    explicit MasterServiceTestPeer(WrappedMasterService& service)
+        : service_(service.master_service_) {}
+
+    void FillFencedWriteHistoryForKey(const std::string& key,
+                                      const UUID& owner) {
+        const auto index = service_.getShardIndex(TenantId::Default(), key);
+        MasterService::MetadataShardAccessorRW shard(&service_, index);
+        auto& history = service_.fenced_write_watermarks_[index];
+        for (size_t i = 0; i < MasterService::kMaxFencedWriteHistoryPerShard;
+             ++i) {
+            history[{"retired_" + std::to_string(i), owner}] = 1;
+        }
+    }
+
+    void ExpireProcessingAt(std::chrono::system_clock::time_point now) {
+        std::shared_lock lock(service_.master_state_mutex_);
+        for (size_t i = 0; i < MasterService::kNumShards; ++i) {
+            MasterService::MetadataShardAccessorRW shard(&service_, i);
+            service_.DiscardExpiredProcessingReplicas(shard, now);
+        }
+    }
 
     using GroupDomainAccessorRO = MasterService::GroupDomainAccessorRO;
     using GroupDomainAccessorRW = MasterService::GroupDomainAccessorRW;

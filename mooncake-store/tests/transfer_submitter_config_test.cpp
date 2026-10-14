@@ -112,5 +112,29 @@ TEST_F(TransferSubmitterConfigTest, NewConfigsReadCurrentEnvironment) {
     EXPECT_FALSE(third.memcpy_enabled_override.has_value());
 }
 
+TEST_F(TransferSubmitterConfigTest,
+       ParallelDfsPutDefaultsOffAndReadsPerClient) {
+    const char* name = "MC_STORE_PARALLEL_DFS_PUT";
+    const char* previous = std::getenv(name);
+    const std::optional<std::string> saved =
+        previous ? std::optional<std::string>(previous) : std::nullopt;
+    ASSERT_EQ(unsetenv(name), 0);
+    EXPECT_FALSE(TransferSubmitterConfig::FromEnvironment().parallel_dfs_put);
+    for (const auto* value : {"1", "true", "TRUE"}) {
+        ASSERT_EQ(setenv(name, value, 1), 0);
+        EXPECT_TRUE(
+            TransferSubmitterConfig::FromEnvironment().parallel_dfs_put);
+    }
+    for (const auto* value : {"0", "false", "invalid", ""}) {
+        ASSERT_EQ(setenv(name, value, 1), 0);
+        EXPECT_FALSE(
+            TransferSubmitterConfig::FromEnvironment().parallel_dfs_put);
+    }
+    if (saved)
+        setenv(name, saved->c_str(), 1);
+    else
+        unsetenv(name);
+}
+
 }  // namespace
 }  // namespace mooncake

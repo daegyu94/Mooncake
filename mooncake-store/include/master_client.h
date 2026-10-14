@@ -131,6 +131,16 @@ class MasterClient {
      * @param object_key Key to query
      * @return tl::expected<bool, ErrorCode> indicating exist or not
      */
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchStartFencedDfsWrite(const std::vector<std::string>& keys,
+                             const std::vector<std::vector<uint64_t>>& lengths,
+                             const ReplicateConfig& config, const UUID& attempt,
+                             bool upsert);
+    std::vector<tl::expected<void, ErrorCode>> BatchEndFencedDfsWrite(
+        const std::vector<ObjectMeta>& objects, const UUID& attempt);
+    std::vector<tl::expected<void, ErrorCode>> BatchRevokeFencedDfsWrite(
+        const std::vector<std::string>& keys, const UUID& attempt);
+
     [[nodiscard]] tl::expected<bool, ErrorCode> ExistKey(
         const std::string& object_key);
 

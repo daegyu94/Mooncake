@@ -41,6 +41,8 @@
 #include "common/network.h"
 #include "config/client_host_identity_config.h"
 #include "config/client_object_checksum_config.h"
+#include "config/transfer_submitter_config.h"
+#include "config/dfs_write_fencing_config.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
 #include "config/client_auto_discovery_config.h"
@@ -452,6 +454,9 @@ Client::Client(const std::string& local_hostname,
       protocol_(protocol),
       object_checksum_enabled_(
           ClientObjectChecksumConfig::IsEnabledAtFirstUse()),
+      parallel_dfs_put_(
+          TransferSubmitterConfig::FromEnvironment().parallel_dfs_put),
+      fenced_dfs_writes_(parallel_dfs_put_ || DfsWriteFencingConfig::Enabled()),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
@@ -1702,6 +1707,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         pending_transfers;
     std::vector<DfsReadRequest> dfs_read_requests;
     std::vector<size_t> dfs_read_indices;
+    std::shared_ptr<DistributedStorageBackend> dfs_backend;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
     // Record batch get transfer latency (Submit + Wait)
     auto t0_batch_get = std::chrono::steady_clock::now();
@@ -1744,7 +1750,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         // Submit transfer operation asynchronously
         std::optional<TransferFuture> future;
         if (replica.is_dfs_replica()) {
-            if (!dfs_storage_backend_) {
+            if (!dfs_backend)
+                dfs_backend = std::atomic_load(&dfs_storage_backend_);
+            if (!dfs_backend) {
                 LOG(ERROR) << "DFS backend is not initialized";
                 if (auto* dfs_metric = GetDfsMetricPtr()) {
                     dfs_metric->RecordReadErrors(
@@ -1795,7 +1803,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     if (!dfs_read_requests.empty()) {
         auto* dfs_metric = GetDfsMetricPtr();
         const auto dfs_read_start = std::chrono::steady_clock::now();
-        auto dfs_results = dfs_storage_backend_->BatchRead(dfs_read_requests);
+        auto dfs_results = dfs_backend->BatchRead(dfs_read_requests);
         const auto dfs_read_latency_us = elapsed_us_since(dfs_read_start);
         int64_t dfs_success_keys = 0;
         uint64_t dfs_success_bytes = 0;
@@ -1959,6 +1967,12 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
+    if (fenced_dfs_writes_ && config.dfs_replica_num > 0) {
+        std::vector<std::vector<Slice>> batch{slices};
+        auto results = BatchPut({key}, batch, config);
+        return results.size() == 1 ? results[0]
+                                   : tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2176,6 +2190,12 @@ Client::DiskReplicaHealResult Client::healDanglingLocalDiskReplica(
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
+    if (fenced_dfs_writes_ && config.dfs_replica_num > 0) {
+        std::vector<std::vector<Slice>> batch{slices};
+        auto results = BatchUpsert({key}, batch, config);
+        return results.size() == 1 ? results[0]
+                                   : tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2354,6 +2374,7 @@ class PutOperation {
     std::string key;
     std::vector<Slice> slices;
     std::optional<uint64_t> object_checksum;
+    std::optional<UUID> write_attempt;
     std::vector<std::vector<Slice>> batched_slices;
 
     // Enhanced state tracking
@@ -2600,8 +2621,32 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         return;
     }
 
+    const bool fenced = fenced_dfs_writes_ && config.dfs_replica_num > 0;
+    if (fenced && (!transfer_engine_ || transfer_engine_->isUsingTent())) {
+        for (auto index : active_indices)
+            ops[index].SetTerminalError(ErrorCode::NOT_SUPPORTED,
+                                        PutOperationState::MASTER_FAILED);
+        return;
+    }
+    if (fenced) {
+        uint64_t sequence = next_dfs_write_sequence_.load();
+        do {
+            if (sequence == std::numeric_limits<uint64_t>::max()) {
+                for (auto index : active_indices)
+                    ops[index].SetTerminalError(
+                        ErrorCode::INVALID_WRITE,
+                        PutOperationState::MASTER_FAILED);
+                return;
+            }
+        } while (!next_dfs_write_sequence_.compare_exchange_weak(sequence,
+                                                                 sequence + 1));
+        const UUID attempt{sequence, client_id_.second};
+        for (auto& op : ops) op.write_attempt = attempt;
+    }
     auto start_responses =
-        master_client_.BatchPutStart(keys, slice_lengths, config);
+        fenced ? master_client_.BatchStartFencedDfsWrite(
+                     keys, slice_lengths, config, *ops[0].write_attempt, false)
+               : master_client_.BatchPutStart(keys, slice_lengths, config);
 
     // Ensure response size matches request size
     if (start_responses.size() != active_indices.size()) {
@@ -2699,8 +2744,32 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
         return;
     }
 
+    const bool fenced = fenced_dfs_writes_ && config.dfs_replica_num > 0;
+    if (fenced && (!transfer_engine_ || transfer_engine_->isUsingTent())) {
+        for (auto index : active_indices)
+            ops[index].SetTerminalError(ErrorCode::NOT_SUPPORTED,
+                                        PutOperationState::MASTER_FAILED);
+        return;
+    }
+    if (fenced) {
+        uint64_t sequence = next_dfs_write_sequence_.load();
+        do {
+            if (sequence == std::numeric_limits<uint64_t>::max()) {
+                for (auto index : active_indices)
+                    ops[index].SetTerminalError(
+                        ErrorCode::INVALID_WRITE,
+                        PutOperationState::MASTER_FAILED);
+                return;
+            }
+        } while (!next_dfs_write_sequence_.compare_exchange_weak(sequence,
+                                                                 sequence + 1));
+        const UUID attempt{sequence, client_id_.second};
+        for (auto& op : ops) op.write_attempt = attempt;
+    }
     auto start_responses =
-        master_client_.BatchUpsertStart(keys, slice_lengths, config);
+        fenced ? master_client_.BatchStartFencedDfsWrite(
+                     keys, slice_lengths, config, *ops[0].write_attempt, true)
+               : master_client_.BatchUpsertStart(keys, slice_lengths, config);
 
     // Ensure response size matches request size
     if (start_responses.size() != active_indices.size()) {
@@ -2835,7 +2904,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
     }
 }
 
-void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
+void Client::WaitForTransfers(std::vector<PutOperation>& ops, bool drain) {
     for (auto& op : ops) {
         // Skip operations that already failed or completed
         if (op.IsResolved()) {
@@ -2845,6 +2914,7 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
         for (size_t i = 0; i < op.pending_transfers.size(); ++i) {
             auto& pending_transfer = op.pending_transfers[i];
             ErrorCode transfer_result = pending_transfer.future.get();
+            if (drain) pending_transfer.future.drain();
             if (transfer_result != ErrorCode::OK) {
                 op.transfer_summary.RecordFailure(pending_transfer.replica_type,
                                                   transfer_result);
@@ -2876,7 +2946,8 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     if (keys.empty()) {
         return {};
     }
-    if (!dfs_storage_backend_) {
+    const auto dfs_backend = std::atomic_load(&dfs_storage_backend_);
+    if (!dfs_backend) {
         LOG(ERROR) << "DFS backend is unavailable for synchronous write";
         if (auto* dfs_metric = GetDfsMetricPtr()) {
             dfs_metric->RecordWriteErrors(
@@ -2969,7 +3040,7 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     }
 
     const auto write_start = std::chrono::steady_clock::now();
-    auto write_results = dfs_storage_backend_->BatchWrite(requests);
+    auto write_results = dfs_backend->BatchWrite(requests);
     const auto write_latency_us = elapsed_us_since(write_start);
     int64_t success_keys = 0;
     uint64_t success_bytes = 0;
@@ -3016,7 +3087,63 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     return results;
 }
 
+bool Client::ShouldOverlapDfs(const std::vector<PutOperation>& ops) const {
+    if (!parallel_dfs_put_ || !std::atomic_load(&dfs_storage_backend_) ||
+        !transfer_engine_ || transfer_engine_->isUsingTent())
+        return false;
+    {
+        std::lock_guard lock(mounted_segments_mutex_);
+        for (const auto& op : ops) {
+            for (const auto& slice : op.slices) {
+                const auto address = reinterpret_cast<uintptr_t>(slice.ptr);
+                for (const auto& [id, segment] : mounted_segments_) {
+                    if (address >= segment.base &&
+                        address - segment.base < segment.size)
+                        return false;
+                }
+            }
+        }
+    }
+    return std::any_of(ops.begin(), ops.end(),
+                       [](const PutOperation& op) {
+                           return !op.IsResolved() &&
+                                  op.transfer_summary.allocated_dfs_replicas >
+                                      0;
+                       }) &&
+           std::none_of(ops.begin(), ops.end(), [](const PutOperation& op) {
+               return std::any_of(op.replicas.begin(), op.replicas.end(),
+                                  [](const Replica::Descriptor& replica) {
+                                      return replica.is_disk_replica();
+                                  });
+           });
+}
+
+void Client::TransferAndWriteDfs(std::vector<PutOperation>& ops) {
+    const bool overlap = ShouldOverlapDfs(ops);
+    SubmitTransfers(ops);
+    if (!overlap) {
+        WaitForTransfers(ops, !ops.empty() && ops[0].write_attempt.has_value());
+        SubmitDfsWrites(ops);
+        return;
+    }
+    std::vector<std::optional<ErrorCode>> dfs_results;
+    try {
+        dfs_results = CollectDfsWriteResults(ops, true);
+    } catch (...) {
+        WaitForTransfers(ops, true);
+        throw;
+    }
+    WaitForTransfers(ops, true);
+    ApplyDfsWriteResults(ops, dfs_results);
+}
+
 void Client::SubmitDfsWrites(std::vector<PutOperation>& ops) {
+    ApplyDfsWriteResults(ops, CollectDfsWriteResults(ops, false));
+}
+
+std::vector<std::optional<ErrorCode>> Client::CollectDfsWriteResults(
+    std::vector<PutOperation>& ops, bool allow_pending) {
+    std::vector<std::optional<ErrorCode>> deferred_results(ops.size());
     std::vector<std::string> keys;
     std::vector<const std::vector<Slice>*> slice_lists;
     std::vector<DistributedFSDescriptor> descriptors;
@@ -3033,7 +3160,11 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops) {
         // A DFS replica was allocated but is abandoned because a peer replica
         // failed first. Without this counter the write simply disappears: no
         // error is recorded against DFS and no I/O is attempted.
-        if (!NonDfsTransfersSucceeded(op.transfer_summary)) {
+        const bool known_failure =
+            op.transfer_summary.failed_memory_transfers > 0 ||
+            op.transfer_summary.failed_nof_transfers > 0;
+        if (allow_pending ? known_failure
+                          : !NonDfsTransfersSucceeded(op.transfer_summary)) {
             ++skipped_writes;
             VLOG(1) << "Skipping DFS write, action=skip, key=" << op.key
                     << ", reason=non_dfs_transfer_failed";
@@ -3045,9 +3176,7 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops) {
                                        return replica.is_dfs_replica();
                                    });
         if (dfs_it == op.replicas.end()) {
-            op.transfer_summary.RecordFailure(ReplicaType::DFS,
-                                              ErrorCode::INVALID_REPLICA);
-            op.AppendFailureContext("Allocated DFS replica has no descriptor");
+            deferred_results[i] = ErrorCode::INVALID_REPLICA;
             if (dfs_metric) {
                 dfs_metric->RecordWriteErrors(
                     toString(ErrorCode::INVALID_REPLICA));
@@ -3064,14 +3193,28 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops) {
     }
 
     auto results = WriteDfsReplicas(keys, slice_lists, descriptors);
-    for (size_t i = 0; i < results.size(); ++i) {
-        auto& op = ops[op_indices[i]];
-        if (results[i] == ErrorCode::OK) {
+    for (size_t i = 0; i < op_indices.size(); ++i) {
+        deferred_results[op_indices[i]] = results.size() == op_indices.size()
+                                              ? results[i]
+                                              : ErrorCode::INTERNAL_ERROR;
+    }
+    return deferred_results;
+}
+
+void Client::ApplyDfsWriteResults(
+    std::vector<PutOperation>& ops,
+    const std::vector<std::optional<ErrorCode>>& results) {
+    for (size_t i = 0; i < ops.size(); ++i) {
+        if (!results[i]) continue;
+        auto& op = ops[i];
+        if (*results[i] == ErrorCode::OK) {
             op.transfer_summary.RecordSuccess(ReplicaType::DFS);
         } else {
-            op.transfer_summary.RecordFailure(ReplicaType::DFS, results[i]);
-            op.AppendFailureContext("Synchronous DFS write failed: " +
-                                    toString(results[i]));
+            op.transfer_summary.RecordFailure(ReplicaType::DFS, *results[i]);
+            op.AppendFailureContext(
+                *results[i] == ErrorCode::INVALID_REPLICA
+                    ? "Allocated DFS replica has no descriptor"
+                    : "Synchronous DFS write failed: " + toString(*results[i]));
         }
     }
 }
@@ -3174,7 +3317,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
             object_metas.emplace_back(ObjectMeta{
                 group.keys[i], ops[group.indices[i]].object_checksum});
         }
-        auto responses = master_client_.BatchPutEnd(object_metas, replica_type);
+        auto responses =
+            ops[group.indices[0]].write_attempt
+                ? master_client_.BatchEndFencedDfsWrite(
+                      object_metas, *ops[group.indices[0]].write_attempt)
+                : master_client_.BatchPutEnd(object_metas, replica_type);
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
                 finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
@@ -3201,7 +3348,10 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
             return;
         }
         auto responses =
-            master_client_.BatchPutRevoke(group.keys, replica_type);
+            ops[group.indices[0]].write_attempt
+                ? master_client_.BatchRevokeFencedDfsWrite(
+                      group.keys, *ops[group.indices[0]].write_attempt)
+                : master_client_.BatchPutRevoke(group.keys, replica_type);
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
                 finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
@@ -3322,7 +3472,11 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
     if (!successful_object_metas.empty()) {
         finalized_keys.reserve(successful_object_metas.size());
         auto end_responses =
-            master_client_.BatchUpsertEnd(successful_object_metas);
+            ops[successful_indices[0]].write_attempt
+                ? master_client_.BatchEndFencedDfsWrite(
+                      successful_object_metas,
+                      *ops[successful_indices[0]].write_attempt)
+                : master_client_.BatchUpsertEnd(successful_object_metas);
         if (end_responses.size() != successful_object_metas.size()) {
             LOG(ERROR) << "BatchUpsertEnd response size mismatch: expected "
                        << successful_object_metas.size() << ", got "
@@ -3361,7 +3515,11 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
 
     // Process failed operations that need cleanup
     if (!failed_keys.empty()) {
-        auto revoke_responses = master_client_.BatchUpsertRevoke(failed_keys);
+        auto revoke_responses =
+            ops[failed_indices[0]].write_attempt
+                ? master_client_.BatchRevokeFencedDfsWrite(
+                      failed_keys, *ops[failed_indices[0]].write_attempt)
+                : master_client_.BatchUpsertRevoke(failed_keys);
         if (revoke_responses.size() != failed_keys.size()) {
             LOG(ERROR) << "BatchUpsertRevoke response size mismatch: expected "
                        << failed_keys.size() << ", got "
@@ -3529,7 +3687,35 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
                     << " transfers for key " << merged_ops.back().key;
         }
     }
-    WaitForTransfers(merged_ops);
+    const bool overlap = !is_upsert && ShouldOverlapDfs(ops);
+    std::vector<std::optional<ErrorCode>> dfs_results;
+    if (overlap) {
+        for (auto& op : ops) {
+            if (op.IsResolved()) continue;
+            const auto& seg = op.replicas[0]
+                                  .get_memory_descriptor()
+                                  .buffer_descriptor.transport_endpoint_;
+            auto merged = std::find_if(
+                merged_ops.begin(), merged_ops.end(),
+                [&](const PutOperation& candidate) {
+                    return candidate.replicas[0]
+                               .get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_ == seg;
+                });
+            if (merged != merged_ops.end()) {
+                op.transfer_summary.failed_memory_transfers =
+                    merged->transfer_summary.failed_memory_transfers;
+            }
+        }
+        try {
+            dfs_results = CollectDfsWriteResults(ops, true);
+        } catch (...) {
+            WaitForTransfers(merged_ops, true);
+            throw;
+        }
+    }
+    WaitForTransfers(merged_ops, overlap || (!ops.empty() &&
+                                             ops[0].write_attempt.has_value()));
     for (auto& op : merged_ops) {
         auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
         auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
@@ -3555,7 +3741,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
             seg_to_ops.at(seg).transfer_summary.first_error;
         op.failure_context = seg_to_ops.at(seg).failure_context;
     }
-    SubmitDfsWrites(ops);
+    if (overlap) {
+        ApplyDfsWriteResults(ops, dfs_results);
+    } else {
+        SubmitDfsWrites(ops);
+    }
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
@@ -3600,9 +3790,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     StageWriteBuffersForRemoteReplicas(ops, stager);
 
     auto t0 = std::chrono::steady_clock::now();
-    SubmitTransfers(ops);
-    WaitForTransfers(ops);
-    SubmitDfsWrites(ops);
+    TransferAndWriteDfs(ops);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
@@ -3647,7 +3835,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     StageWriteBuffersForRemoteReplicas(ops, stager);
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
-    WaitForTransfers(ops);
+    WaitForTransfers(ops, !ops.empty() && ops[0].write_attempt.has_value());
     SubmitDfsWrites(ops);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
@@ -3664,6 +3852,11 @@ std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
                               const std::vector<uint64_t>& object_sizes,
                               const ReplicateConfig& config) {
+    if (fenced_dfs_writes_ && config.dfs_replica_num > 0) {
+        return std::vector<
+            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::NOT_SUPPORTED));
+    }
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     if (keys.size() != object_sizes.size()) {
@@ -4247,7 +4440,7 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
 
 void Client::SetDfsStorageBackend(
     std::shared_ptr<DistributedStorageBackend> backend) {
-    dfs_storage_backend_ = std::move(backend);
+    std::atomic_store(&dfs_storage_backend_, std::move(backend));
     EnsureStorageControlPlaneStarted();
 }
 
@@ -5022,7 +5215,8 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
     if (!replica_descriptor.is_dfs_replica()) {
         return ErrorCode::INVALID_REPLICA;
     }
-    if (!dfs_storage_backend_) {
+    const auto dfs_backend = std::atomic_load(&dfs_storage_backend_);
+    if (!dfs_backend) {
         LOG(ERROR) << "DFS backend is not initialized";
         if (auto* dfs_metric = GetDfsMetricPtr()) {
             dfs_metric->RecordReadErrors(
@@ -5035,7 +5229,7 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
     const auto& desc = replica_descriptor.get_dfs_descriptor();
     std::vector<DfsReadRequest> requests{DfsReadRequest{key, desc, slices}};
     const auto read_start = std::chrono::steady_clock::now();
-    auto results = dfs_storage_backend_->BatchRead(requests);
+    auto results = dfs_backend->BatchRead(requests);
     const auto read_latency_us = elapsed_us_since(read_start);
     if (results.size() != 1) {
         LOG(ERROR) << "DFS BatchRead response size mismatch for key " << key;

@@ -89,6 +89,19 @@ class WrappedMasterService {
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListForAdmin(
         const std::string& key, const std::string& tenant_id = "default");
 
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchStartFencedDfsWrite(const UUID& client_id,
+                             const std::vector<std::string>& keys,
+                             const std::vector<uint64_t>& lengths,
+                             const ReplicateConfig& config, const UUID& attempt,
+                             bool upsert, const std::string& tenant_id);
+    std::vector<tl::expected<void, ErrorCode>> BatchEndFencedDfsWrite(
+        const UUID& client_id, const std::vector<ObjectMeta>& objects,
+        const UUID& attempt, const std::string& tenant_id);
+    std::vector<tl::expected<void, ErrorCode>> BatchRevokeFencedDfsWrite(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const UUID& attempt, const std::string& tenant_id);
+
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
@@ -374,6 +387,7 @@ class WrappedMasterService {
     KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
+    friend class test::MasterServiceTestPeer;
     MasterService master_service_;
 };
 

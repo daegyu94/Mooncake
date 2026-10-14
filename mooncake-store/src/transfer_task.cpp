@@ -793,12 +793,63 @@ void MemcpyWorkerPool::workerThread() {
 // ============================================================================
 
 TransferEngineOperationState::~TransferEngineOperationState() {
+    if (batch_id_ == INVALID_BATCH_ID) return;
 #ifdef USE_TENT
     if (tent_engine_)
         tent_engine_->freeBatch(batch_id_);
     else
 #endif
         engine_.freeBatchID(batch_id_);
+}
+
+void TransferEngineOperationState::drain() { drain_batch(false); }
+
+void TransferEngineOperationState::drain_after_submit_failure() {
+    drain_batch(true);
+}
+
+void TransferEngineOperationState::drain_batch(bool submission_failed) {
+    if (batch_id_ == INVALID_BATCH_ID) return;
+#ifdef USE_TENT
+    // The parallel DFS path is disabled for TENT until its drain contract is
+    // validated. Do not interpret a failed wait as a cancellation
+    // acknowledgement.
+    if (tent_engine_) {
+        wait_for_completion();
+        return;
+    }
+#endif
+    auto& batch = Transport::toBatchDesc(batch_id_);
+    while (true) {
+        for (size_t i = 0; i < batch.task_list.size(); ++i) {
+            auto& task = batch.task_list[i];
+            if (__atomic_load_n(&task.is_finished, __ATOMIC_ACQUIRE)) continue;
+            if (submission_failed &&
+                __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE) == 0) {
+                // A failed synchronous submission can leave unposted tasks.
+                __atomic_store_n(&task.is_finished, true, __ATOMIC_RELEASE);
+                continue;
+            }
+            TransferStatus status;
+            // Poll even when the logical result is already a timeout/error.
+            // A status error cannot authorize releasing the live batch.
+            (void)engine_.getTransferStatus(batch_id_, i, status);
+        }
+        const bool finished = std::all_of(
+            batch.task_list.begin(), batch.task_list.end(),
+            [](const auto& task) {
+                return __atomic_load_n(&task.is_finished, __ATOMIC_ACQUIRE);
+            });
+        if (finished && batch.active_completion_callbacks.load(
+                            std::memory_order_acquire) == 0) {
+            const auto status = engine_.freeBatchID(batch_id_);
+            if (status.ok() || status.IsBatchCleanupDeferred()) {
+                batch_id_ = INVALID_BATCH_ID;
+                return;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
 }
 
 bool TransferEngineOperationState::is_completed() {
@@ -1800,7 +1851,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         if (!s.ok()) {
             LOG(ERROR) << "Failed to submit all transfers, error code is "
                        << s.code();
-            engine_.freeBatchID(batch_id);
+            TransferEngineOperationState failed(engine_, batch_id, batch_size);
+            failed.drain_after_submit_failure();
             return std::nullopt;
         }
     }

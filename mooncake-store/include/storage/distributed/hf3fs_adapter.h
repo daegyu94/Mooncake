@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <shared_mutex>
 
 #include "storage/distributed/fs_adapter.h"
 
@@ -49,6 +50,7 @@ class Hf3fsAdapter : public FileSystemAdapter {
     const char* GetName() const override { return "hf3fs"; }
 
    private:
+    mutable std::shared_mutex lifecycle_mutex_;
     std::unique_ptr<USRBIOResourceManager> resource_manager_;
 };
 
