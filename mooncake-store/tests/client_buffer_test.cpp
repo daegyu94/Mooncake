@@ -9,6 +9,7 @@
 #include <cstring>
 #include <new>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace mooncake {
@@ -193,6 +194,83 @@ TEST_F(ClientBufferTest, BufferHandleMoveConstructor) {
 
     // Verify memory is still usable through handle2
     VerifyBufferHandle(handle2, alloc_size);
+}
+
+TEST_F(ClientBufferTest, ViewMoveAssignmentReleasesPreviousView) {
+    static_assert(std::is_nothrow_move_assignable_v<BufferHandle>);
+    char first[16], second[32];
+    int first_releases = 0, second_releases = 0;
+    {
+        BufferHandle destination(first, sizeof(first),
+                                 [&] { ++first_releases; });
+        BufferHandle source(second, sizeof(second), [&] { ++second_releases; });
+        destination = std::move(source);
+        EXPECT_EQ(first_releases, 1);
+        EXPECT_EQ(second_releases, 0);
+        EXPECT_EQ(destination.ptr(), second);
+        EXPECT_EQ(destination.size(), sizeof(second));
+        EXPECT_EQ(source.ptr(), nullptr);
+        EXPECT_EQ(source.size(), 0);
+
+        auto& alias = destination;
+        destination = std::move(alias);
+        EXPECT_EQ(second_releases, 0);
+        EXPECT_EQ(destination.ptr(), second);
+    }
+    EXPECT_EQ(first_releases, 1);
+    EXPECT_EQ(second_releases, 1);
+}
+
+TEST_F(ClientBufferTest, MoveAssignmentBetweenOwningAndViewHandles) {
+    auto allocator = ClientBufferAllocator::create(4096);
+    auto allocation = allocator->allocate(4096);
+    ASSERT_TRUE(allocation.has_value());
+    BufferHandle destination(std::move(*allocation));
+    char data[16];
+    int releases = 0;
+    {
+        BufferHandle source(data, sizeof(data), [&] { ++releases; });
+        destination = std::move(source);
+    }
+    EXPECT_EQ(releases, 0);
+    EXPECT_EQ(destination.ptr(), data);
+    allocation = allocator->allocate(4096);
+    ASSERT_TRUE(allocation.has_value());
+    void* ptr = allocation->ptr();
+    destination = std::move(*allocation);
+    EXPECT_EQ(releases, 1);
+    EXPECT_EQ(destination.ptr(), ptr);
+    EXPECT_EQ(destination.size(), 4096);
+}
+
+TEST_F(ClientBufferTest, OwningMoveAssignmentReturnsPreviousAllocation) {
+    auto allocator = ClientBufferAllocator::create(4096);
+    auto first = allocator->allocate(2048);
+    auto second = allocator->allocate(2048);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(second.has_value());
+    BufferHandle destination(std::move(*first));
+    destination = std::move(*second);
+    EXPECT_TRUE(allocator->allocate(2048).has_value());
+}
+
+TEST_F(ClientBufferTest, ErasingViewHandleReleasesEachViewOnce) {
+    char data[3];
+    int releases[3] = {};
+    {
+        std::vector<BufferHandle> handles;
+        for (int i = 0; i < 3; ++i) {
+            handles.emplace_back(&data[i], 1, [&, i] { ++releases[i]; });
+        }
+        handles.erase(handles.begin());
+        EXPECT_EQ(releases[0], 1);
+        EXPECT_EQ(releases[1], 0);
+        EXPECT_EQ(releases[2], 0);
+        ASSERT_EQ(handles.size(), 2);
+        EXPECT_EQ(handles[0].ptr(), &data[1]);
+        EXPECT_EQ(handles[1].ptr(), &data[2]);
+    }
+    for (int count : releases) EXPECT_EQ(count, 1);
 }
 
 // Test split_into_slices function

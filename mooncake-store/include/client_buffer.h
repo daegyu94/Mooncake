@@ -4,6 +4,7 @@
 #include <optional>
 #include <vector>
 #include <string>
+#include <utility>
 
 #include "offset_allocator/offset_allocator.h"
 #include "types.h"
@@ -91,7 +92,17 @@ class BufferHandle {
     ~BufferHandle();
 
     BufferHandle(BufferHandle&&) = default;  // Allow move operations
-    BufferHandle& operator=(BufferHandle&&) = default;
+    BufferHandle& operator=(BufferHandle&& other) noexcept {
+        if (this != &other) {
+            if (release_fn_) release_fn_();
+            handle_ = std::move(other.handle_);
+            allocator_ = std::move(other.allocator_);
+            view_ptr_ = std::exchange(other.view_ptr_, nullptr);
+            view_size_ = std::exchange(other.view_size_, 0);
+            release_fn_ = std::exchange(other.release_fn_, {});
+        }
+        return *this;
+    }
 
     // Disable copy constructor and copy assignment operator
     BufferHandle(const BufferHandle&) = delete;
