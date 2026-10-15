@@ -2,13 +2,16 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 
 namespace mooncake {
 
@@ -18,12 +21,50 @@ tl::expected<void, ErrorCode> ValidateIov(const iovec* iov, int iovcnt) {
     if (iovcnt < 0 || (iovcnt > 0 && iov == nullptr)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    size_t bytes = 0;
     for (int i = 0; i < iovcnt; ++i) {
         if (!iov[i].iov_base && iov[i].iov_len > 0) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+        if (iov[i].iov_len > std::numeric_limits<size_t>::max() - bytes) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        bytes += iov[i].iov_len;
     }
     return {};
+}
+
+template <typename Operation>
+tl::expected<size_t, ErrorCode> TransferIov(int fd, const iovec* iov,
+                                            int iovcnt, int64_t offset,
+                                            Operation operation,
+                                            ErrorCode error) {
+    if (fd < 0 || offset < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto valid = ValidateIov(iov, iovcnt);
+    if (!valid) return tl::make_unexpected(valid.error());
+
+    size_t transferred = 0;
+    for (int index = 0; index < iovcnt;) {
+        const int count = std::min(iovcnt - index, IOV_MAX);
+        size_t bytes = 0;
+        for (int i = 0; i < count; ++i) bytes += iov[index + i].iov_len;
+        ssize_t ret;
+        do {
+            ret = operation(fd, iov + index, count, static_cast<off_t>(offset));
+        } while (ret < 0 && errno == EINTR);
+        if (ret < 0) return tl::make_unexpected(error);
+        transferred += static_cast<size_t>(ret);
+        index += count;
+        // Preserve short-I/O semantics for the backend's retry policy.
+        if (static_cast<size_t>(ret) < bytes || index == iovcnt) break;
+        if (ret > std::numeric_limits<int64_t>::max() - offset) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        offset += ret;
+    }
+    return transferred;
 }
 
 ErrorCode ReadOpenError() {
@@ -129,37 +170,15 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::WriteAt(int fd,
                                                         const iovec* iov,
                                                         int iovcnt,
                                                         int64_t offset) {
-    if (fd < 0 || offset < 0) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    auto valid = ValidateIov(iov, iovcnt);
-    if (!valid) return tl::make_unexpected(valid.error());
-    if (iovcnt == 0) return size_t{0};
-
-    ssize_t ret;
-    do {
-        ret = ::pwritev(fd, iov, iovcnt, static_cast<off_t>(offset));
-    } while (ret < 0 && errno == EINTR);
-    if (ret < 0) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    return static_cast<size_t>(ret);
+    return TransferIov(fd, iov, iovcnt, offset, ::pwritev,
+                       ErrorCode::FILE_WRITE_FAIL);
 }
 
 tl::expected<size_t, ErrorCode> PosixFsAdapter::ReadAt(int fd, iovec* iov,
                                                        int iovcnt,
                                                        int64_t offset) {
-    if (fd < 0 || offset < 0) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    auto valid = ValidateIov(iov, iovcnt);
-    if (!valid) return tl::make_unexpected(valid.error());
-    if (iovcnt == 0) return size_t{0};
-
-    ssize_t ret;
-    do {
-        ret = ::preadv(fd, iov, iovcnt, static_cast<off_t>(offset));
-    } while (ret < 0 && errno == EINTR);
-    if (ret < 0) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-    return static_cast<size_t>(ret);
+    return TransferIov(fd, iov, iovcnt, offset, ::preadv,
+                       ErrorCode::FILE_READ_FAIL);
 }
 
 }  // namespace mooncake

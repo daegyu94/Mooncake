@@ -235,6 +235,123 @@ TEST_F(FsAdapterFdTest, MultiIovWriteRead) {
     adapter_->CloseFile(*fd);
 }
 
+TEST_F(FsAdapterFdTest, IovLimitBoundaries) {
+    const int limit = static_cast<int>(::sysconf(_SC_IOV_MAX));
+    ASSERT_GT(limit, 1);
+    for (const int count : {limit - 1, limit, limit + 1, 2 * limit + 1}) {
+        SCOPED_TRACE(count);
+        std::string input(count, '\0'), output(count, '?');
+        std::vector<iovec> wiov(count), riov(count);
+        std::string expected;
+        for (int i = 0; i < count; ++i) {
+            input[i] = static_cast<char>('a' + i % 26);
+            const size_t length = i % 7 == 0 ? 0 : 1;
+            wiov[i] = {input.data() + i, length};
+            riov[i] = {output.data() + i, length};
+            if (length) expected.push_back(input[i]);
+        }
+        auto fd = adapter_->OpenFile(tmp_->file("many_iov.data"));
+        ASSERT_TRUE(fd);
+        auto written = adapter_->WriteAt(*fd, wiov.data(), count, 101);
+        auto read = adapter_->ReadAt(*fd, riov.data(), count, 101);
+        EXPECT_TRUE(adapter_->CloseFile(*fd));
+        ASSERT_TRUE(written);
+        EXPECT_EQ(*written, expected.size());
+        ASSERT_TRUE(read);
+        EXPECT_EQ(*read, expected.size());
+        for (int i = 0; i < count; ++i) {
+            EXPECT_EQ(output[i], i % 7 == 0 ? '?' : input[i]);
+        }
+        std::string stored(expected.size(), '\0');
+        fd = adapter_->OpenExistingFile(tmp_->file("many_iov.data"));
+        ASSERT_TRUE(fd);
+        iovec contiguous{stored.data(), stored.size()};
+        auto contiguous_read = adapter_->ReadAt(*fd, &contiguous, 1, 101);
+        EXPECT_TRUE(adapter_->CloseFile(*fd));
+        ASSERT_TRUE(contiguous_read);
+        EXPECT_EQ(*contiguous_read, expected.size());
+        EXPECT_EQ(stored, expected);
+    }
+}
+
+TEST_F(FsAdapterFdTest, ZeroLengthIovChunkBeforeData) {
+    const int limit = static_cast<int>(::sysconf(_SC_IOV_MAX));
+    ASSERT_GT(limit, 0);
+    auto fd = adapter_->OpenFile(tmp_->file("zero_iov.data"));
+    ASSERT_TRUE(fd);
+    EXPECT_EQ(adapter_->WriteAt(*fd, nullptr, 0, 31).value(), 0);
+    EXPECT_EQ(adapter_->ReadAt(*fd, nullptr, 0, 31).value(), 0);
+    std::string input = "abc", output(3, '?');
+    std::vector<iovec> wiov(limit + 1, {nullptr, 0});
+    std::vector<iovec> riov(limit + 1, {nullptr, 0});
+    wiov.back() = {input.data(), input.size()};
+    riov.back() = {output.data(), output.size()};
+    auto written = adapter_->WriteAt(*fd, wiov.data(), wiov.size(), 31);
+    auto read = adapter_->ReadAt(*fd, riov.data(), riov.size(), 31);
+    EXPECT_TRUE(adapter_->CloseFile(*fd));
+    ASSERT_TRUE(written);
+    EXPECT_EQ(*written, input.size());
+    ASSERT_TRUE(read);
+    EXPECT_EQ(*read, input.size());
+    EXPECT_EQ(output, input);
+}
+
+TEST_F(FsAdapterFdTest, IovValidationAndSyscallErrors) {
+    const auto path = tmp_->file("iov_errors.data");
+    auto fd = adapter_->OpenFile(path);
+    ASSERT_TRUE(fd);
+    char data = 'x';
+    iovec valid{&data, 1}, invalid{nullptr, 1};
+    EXPECT_EQ(adapter_->WriteAt(-1, &valid, 1, 0).error(),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(adapter_->ReadAt(-1, &valid, 1, 0).error(),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(adapter_->WriteAt(*fd, &valid, 1, -1).error(),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(adapter_->ReadAt(*fd, &valid, 1, -1).error(),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(adapter_->WriteAt(*fd, &invalid, 1, 0).error(),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(adapter_->ReadAt(*fd, &invalid, 1, 0).error(),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_TRUE(adapter_->CloseFile(*fd));
+    const int read_only = ::open(path.c_str(), O_RDONLY);
+    const int write_only = ::open(path.c_str(), O_WRONLY);
+    ASSERT_GE(read_only, 0);
+    ASSERT_GE(write_only, 0);
+    EXPECT_EQ(adapter_->WriteAt(read_only, &valid, 1, 0).error(),
+              ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_EQ(adapter_->ReadAt(write_only, &valid, 1, 0).error(),
+              ErrorCode::FILE_READ_FAIL);
+    EXPECT_TRUE(adapter_->CloseFile(read_only));
+    EXPECT_TRUE(adapter_->CloseFile(write_only));
+}
+
+TEST_F(FsAdapterFdTest, ManyIovReadPreservesShortResult) {
+    const int limit = static_cast<int>(::sysconf(_SC_IOV_MAX));
+    ASSERT_GT(limit, 17);
+    for (const int bytes : {17, limit + 17}) {
+        SCOPED_TRACE(bytes);
+        auto fd = adapter_->OpenFile(tmp_->file(std::to_string(bytes)));
+        ASSERT_TRUE(fd);
+        std::string input(bytes, 'S'), output(2 * limit + 1, '?');
+        iovec source{input.data(), input.size()};
+        auto written = adapter_->WriteAt(*fd, &source, 1, 31);
+        std::vector<iovec> riov(output.size());
+        for (size_t i = 0; i < output.size(); ++i) {
+            riov[i] = {output.data() + i, 1};
+        }
+        auto read = adapter_->ReadAt(*fd, riov.data(), riov.size(), 31);
+        EXPECT_TRUE(adapter_->CloseFile(*fd));
+        ASSERT_TRUE(written);
+        ASSERT_TRUE(read);
+        EXPECT_EQ(*read, input.size());
+        EXPECT_EQ(output.substr(0, bytes), input);
+        EXPECT_EQ(output.substr(bytes),
+                  std::string(output.size() - bytes, '?'));
+    }
+}
+
 TEST_F(FsAdapterFdTest, MultiIovPartialReadAndUnalignedAccess) {
     constexpr size_t total = 8192;
     ASSERT_TRUE(
@@ -976,6 +1093,30 @@ class DfsBackendTest : public ::testing::Test {
     std::unique_ptr<TempDir> tmp_;
     std::unique_ptr<DistributedStorageBackend> backend_;
 };
+
+TEST_F(DfsBackendTest, ManySlicesAtIovLimitBoundaries) {
+    const int limit = static_cast<int>(::sysconf(_SC_IOV_MAX));
+    ASSERT_GT(limit, 1);
+    for (const int count : {limit - 1, limit, limit + 1, 2 * limit + 1}) {
+        SCOPED_TRACE(count);
+        std::string input(count, '\0'), output(count, '?');
+        std::vector<Slice> sources, destinations;
+        for (int i = 0; i < count; ++i) {
+            input[i] = static_cast<char>('a' + i % 26);
+            sources.push_back({input.data() + i, 1});
+            destinations.push_back({output.data() + i, 1});
+        }
+        const DistributedFSDescriptor descriptor{ShardPath(0), 4096,
+                                                 input.size(), 4096, 0};
+        auto writes = backend_->BatchWrite({{"many", descriptor, sources}});
+        ASSERT_EQ(writes.size(), 1);
+        EXPECT_TRUE(writes[0]);
+        auto reads = backend_->BatchRead({{"many", descriptor, destinations}});
+        ASSERT_EQ(reads.size(), 1);
+        ASSERT_TRUE(reads[0]);
+        EXPECT_EQ(input, output);
+    }
+}
 
 class ControlledPosixFsAdapter : public PosixFsAdapter {
    public:
