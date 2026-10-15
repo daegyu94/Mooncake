@@ -6,6 +6,43 @@
 #include <condition_variable>
 #include "thread_pool.h"
 
+#ifdef __linux__
+#include <dlfcn.h>
+#include <pthread.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <cerrno>
+#include <cstdlib>
+#include <system_error>
+
+namespace {
+thread_local int fail_on_create = 0;
+thread_local int create_calls = 0;
+thread_local int joined_threads = 0;
+}  // namespace
+
+// Interpose only in this test executable; libstdc++ calls pthread_create too.
+extern "C" int pthread_create(pthread_t* thread, const pthread_attr_t* attr,
+                              void* (*start)(void*), void* arg) {
+    if (fail_on_create && ++create_calls == fail_on_create) return EAGAIN;
+    using Create = decltype(&pthread_create);
+    static auto real_create =
+        reinterpret_cast<Create>(dlsym(RTLD_NEXT, "pthread_create"));
+    return real_create(thread, attr, start, arg);
+}
+
+extern "C" int pthread_join(pthread_t thread, void** result) {
+    using Join = decltype(&pthread_join);
+    static auto real_join =
+        reinterpret_cast<Join>(dlsym(RTLD_NEXT, "pthread_join"));
+    int error = real_join(thread, result);
+    if (!error) ++joined_threads;
+    return error;
+}
+
+#endif
+
 namespace mooncake {
 
 class ThreadPoolTest : public ::testing::Test {
@@ -132,6 +169,53 @@ TEST_F(ThreadPoolTest, StressTest) {
 
     EXPECT_EQ(counter.load(), num_tasks);
 }
+
+#ifdef __linux__
+namespace {
+
+class ThreadPoolStartupTest : public ::testing::TestWithParam<int> {};
+
+TEST_P(ThreadPoolStartupTest, JoinsStartedWorkersAndRethrowsCreationError) {
+    const int failed_create = GetParam();
+    // Isolate a broken constructor's hang/terminate and bound its runtime.
+    ASSERT_EXIT(
+        {
+            alarm(5);
+            fail_on_create = failed_create;
+            create_calls = 0;
+            joined_threads = 0;
+            bool caught = false;
+            try {
+                ThreadPool pool(4);
+            } catch (const std::system_error& error) {
+                caught =
+                    error.code() == std::errc::resource_unavailable_try_again;
+            }
+            if (!caught || create_calls != failed_create ||
+                joined_threads != failed_create - 1) {
+                std::_Exit(1);
+            }
+
+            fail_on_create = 0;
+            std::atomic<int> completed{0};
+            {
+                ThreadPool pool(2);
+                pool.enqueue([&] { ++completed; });
+                pool.stop();
+                pool.stop();
+            }
+            std::_Exit(completed == 1 && joined_threads == failed_create + 1
+                           ? EXIT_SUCCESS
+                           : EXIT_FAILURE);
+        },
+        ::testing::ExitedWithCode(EXIT_SUCCESS), "");
+}
+
+INSTANTIATE_TEST_SUITE_P(CreationFailures, ThreadPoolStartupTest,
+                         ::testing::Values(1, 2, 4));
+
+}  // namespace
+#endif
 
 }  // namespace mooncake
 
