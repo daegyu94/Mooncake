@@ -5022,8 +5022,9 @@ class _MooncakePayloadTransport:
         for chunk_key, group, size in zip(chunk_keys, chunk_groups, sizes):
             # Each pool lease maps to one physical key, so a single logical group id
             # stays length-1 for each batch_put_from call in this path.
-            lease = pool.acquire(size)
+            lease = None
             try:
+                lease = pool.acquire(size)
                 _copy_memoryviews_to_lease(group, lease)
                 results = _batch_put_from_with_optional_config(
                     batch_put_from, [chunk_key], [lease.ptr], [size], config
@@ -5033,7 +5034,8 @@ class _MooncakePayloadTransport:
                 _cleanup_keys(self._store, chunk_keys, strict=False)
                 raise
             finally:
-                lease.release()
+                if lease is not None:
+                    lease.release()
 
     @staticmethod
     def _check_batch_put_results(

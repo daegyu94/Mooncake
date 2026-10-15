@@ -1993,6 +1993,37 @@ def test_bundle_partial_put_failure_cleans_payloads() -> None:
     assert store.objects == {}
 
 
+@pytest.mark.parametrize("fail_on_call", [1, 2, 3])
+def test_bundle_pool_acquire_failure_cleans_payloads(fail_on_call: int) -> None:
+    failure = RuntimeError("injected pool acquisition failure")
+
+    class FailingBufferPool(FakeBufferPool):
+        attempts = 0
+
+        def acquire(self, size: int, block: object = None) -> FakeLease:
+            self.attempts += 1
+            if self.attempts == fail_on_call:
+                raise failure
+            return super().acquire(size, block)
+
+    pool = FailingBufferPool()
+    store, transfer = make_transfer(buffer_pool=pool)
+    store.put("unrelated", b"keep")
+
+    with pytest.raises(RuntimeError) as caught:
+        transfer.put_bundle(b"meta", {"payload": b"abcdef"}, chunk_bytes=2)
+
+    assert caught.value is failure
+    assert store.batch_put_from_calls == fail_on_call - 1
+    assert pool.acquire_count == pool.release_count == fail_on_call - 1
+    assert store.objects == {"unrelated": b"keep"}
+
+    ref = transfer.put_bundle(b"meta", {"payload": b"abcdef"}, chunk_bytes=2)
+    transfer.remove_bundle(ref)
+    assert pool.acquire_count == pool.release_count
+    assert store.objects == {"unrelated": b"keep"}
+
+
 def test_bundle_cleanup_failure_preserves_put_error() -> None:
     _store, transfer = make_transfer(FailingRemoveStore(fail_on_put=2))
 
