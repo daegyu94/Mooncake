@@ -245,10 +245,7 @@ class _PoolBackedNdarray(np.ndarray):
         return array
 
     def __array_finalize__(self, obj: Any) -> None:
-        # WARNING: slicing/viewing propagates the same _PoolLeaseOwner to the
-        # derived array. If the original array is GC'd first its __del__
-        # releases the pool lease, leaving the slice pointing at freed memory.
-        # Callers must ensure the original array outlives any derived views.
+        # Keep the shared lease alive until the last derived view is gone.
         if obj is not None:
             self._mooncake_pool_owner = getattr(obj, "_mooncake_pool_owner", None)
 
@@ -6325,11 +6322,11 @@ def _decode_typed_ragged_ndarray_rows_fast(
     rows: int,
     metadata: Mapping[str, Any],
 ) -> list[Any] | None:
-    # Returned ndarray rows are views into data; _OwnerBackedList preserves any
-    # pool owner attached to that data for the lifetime of the row list.
+    # Preserve the ndarray subclass so each row view retains its pool owner
+    # even when it outlives the returned list.
     max_ndim = int(metadata.get("max_ndim", 0))
     owner = getattr(data, "_mooncake_pool_owner", None)
-    source = data.view(np.ndarray) if isinstance(data, np.ndarray) else data
+    source = data
     has_nulls = bool(nulls.any())
 
     def attach_owner(values: list[Any]) -> list[Any]:

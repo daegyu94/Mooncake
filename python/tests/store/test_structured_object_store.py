@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import ctypes
+import gc
 import json
 import os
 import threading
 import time
+import weakref
 from types import MappingProxyType
 
 import numpy as np
@@ -4736,6 +4738,75 @@ def test_typed_ragged_fast_decodes_equal_shape_ndarray_views() -> None:
     assert all(isinstance(row, np.ndarray) for row in decoded)
     assert all(np.shares_memory(row, data) for row in decoded)
     assert [row.tolist() for row in decoded] == [row.tolist() for row in rows]
+
+
+@pytest.mark.parametrize("result_type", ["dict", "dataproto"])
+@pytest.mark.parametrize("use_pool", [False, True])
+@pytest.mark.parametrize(
+    "shapes",
+    [
+        pytest.param([(2,), (2,)], id="regular-1d"),
+        pytest.param([(2,), (3,)], id="irregular-1d"),
+        pytest.param([(2,), None, (3,)], id="null-1d"),
+        pytest.param([(2,), (0,)], id="empty-1d"),
+        pytest.param([(2, 3), (2, 3)], id="regular-2d"),
+        pytest.param([(2, 3), (3, 3)], id="irregular-2d"),
+        pytest.param([(2, 3), None, (3, 3)], id="null-2d"),
+        pytest.param([(2, 3), (0, 3)], id="empty-2d"),
+        pytest.param([(1, 2, 3), (2, 2, 3)], id="irregular-3d"),
+    ],
+)
+def test_typed_ragged_row_views_outlive_result(shapes, use_pool, result_type) -> None:
+    pool = FakeBufferPool() if use_pool else None
+    _store, transfer = make_transfer(buffer_pool=pool)
+    rows = np.empty(len(shapes), dtype=object)
+    rows[:] = [
+        None
+        if shape is None
+        else np.arange(np.prod(shape), dtype=np.int32).reshape(shape)
+        for shape in shapes
+    ]
+    ref = transfer.put_dataproto(SimpleDataProto(non_tensor_batch={"tokens": rows}))
+    if result_type == "dict":
+        result = transfer.get(ref, type="dict")
+        values = result["tokens"]
+    else:
+        result = transfer.get_dataproto(ref)
+        values = result["non_tensor_batch"]["tokens"]
+    assert [None if row is None else row.tolist() for row in values] == [
+        None if row is None else row.tolist() for row in rows
+    ]
+    assert [None if row is None else row.shape for row in values] == shapes
+    row = values[0]
+    view = row[..., ::-1]
+    if pool is not None:
+        owner_ref = weakref.ref(values._mooncake_pool_owner)
+        assert row.ctypes.data == owner_ref().lease.ptr
+        releases = pool.release_count
+    else:
+        assert type(row) is np.ndarray
+
+    del values, result
+    gc.collect()
+    if pool is not None:
+        assert owner_ref() is not None
+        assert pool.release_count == releases
+    assert np.array_equal(row, rows[0])
+
+    del row
+    gc.collect()
+    if pool is not None:
+        assert owner_ref() is not None
+        assert pool.release_count == releases
+    assert np.array_equal(view, rows[0][..., ::-1])
+
+    del view
+    gc.collect()
+    if pool is not None:
+        assert owner_ref() is None
+        assert pool.release_count == releases + 1
+        gc.collect()
+        assert pool.release_count == releases + 1
 
 
 def test_typed_ragged_single_ndarray_row_uses_general_layout() -> None:
