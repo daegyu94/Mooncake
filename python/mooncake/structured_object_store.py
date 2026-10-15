@@ -203,6 +203,7 @@ class _DirectCopyPayload:
         )
 
 
+@dataclass(frozen=True)
 class _RawDestinationBuffer:
     ptr: int
     size: int
@@ -1195,19 +1196,11 @@ class MooncakeBundleTransfer:
                 "structured ndarray indexed read requires at least one dimension"
             )
         output_shape = (len(indices), *full_shape[1:])
+        target = _resolve_ndarray_destination(
+            name, destination, dtype_obj, output_shape
+        )
         if isinstance(destination, _RawDestinationBuffer):
-            nbytes = int(np.prod(output_shape, dtype=np.int64)) * dtype_obj.itemsize
-            if destination.size < nbytes:
-                raise ValueError(
-                    f"raw destination has {destination.size} bytes, expected at least {nbytes}"
-                )
-            target = (
-                np.ctypeslib.as_array(
-                    (ctypes.c_uint8 * nbytes).from_address(destination.ptr)
-                )
-                .view(dtype_obj)
-                .reshape(output_shape)
-            )
+            nbytes = target.nbytes
             if not indices:
                 return target
             row_width = dtype_obj.itemsize * int(
@@ -1227,11 +1220,7 @@ class MooncakeBundleTransfer:
                     payload_spec, data, ranges
                 )
                 ctypes.memmove(destination.ptr, bytes(data), nbytes)
-            _ = destination.owner
             return target
-        target = _resolve_ndarray_destination(
-            name, destination, dtype_obj, output_shape
-        )
         if not indices:
             return target
         row_width = dtype_obj.itemsize * int(np.prod(full_shape[1:], dtype=np.int64))
@@ -5580,14 +5569,10 @@ def _resolve_ndarray_destination(
             raise ValueError(
                 f"raw destination has {destination.size} bytes, expected at least {nbytes}"
             )
-        _ = destination.owner
-        return (
-            np.ctypeslib.as_array(
-                (ctypes.c_uint8 * nbytes).from_address(destination.ptr)
-            )
-            .view(dtype)
-            .reshape(shape)
-        )
+        buffer = (ctypes.c_uint8 * nbytes).from_address(destination.ptr)
+        # Keep external memory alive through NumPy's base chain, including views.
+        buffer._mooncake_owner = destination.owner
+        return np.ctypeslib.as_array(buffer).view(dtype).reshape(shape)
     if not isinstance(destination, np.ndarray):
         raise TypeError(
             f"structured ndarray field {name} destination must be a numpy.ndarray or raw_destination"

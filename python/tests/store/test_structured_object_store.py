@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import ctypes
+import gc
 import json
 import os
 import threading
 import time
+import weakref
 from types import MappingProxyType
 
 import numpy as np
@@ -1895,6 +1897,103 @@ def test_structured_object_materialize_into_reuses_destination() -> None:
     assert result.objects["weights"] is destination
     assert np.array_equal(destination, array[2:10])
     assert store.get_into_ranges_calls > 0
+
+
+@pytest.mark.parametrize("pre_registered", [False, True])
+def test_raw_destination_constructor(pre_registered: bool) -> None:
+    owner = object()
+    destination = raw_destination("123", "456", owner, pre_registered=pre_registered)
+
+    assert destination.ptr == 123
+    assert destination.size == 456
+    assert destination.owner is owner
+    assert destination.pre_registered is pre_registered
+    default = raw_destination(123, 456)
+    assert default.owner is None
+    assert default.pre_registered is False
+
+
+@pytest.mark.parametrize("read", ["materialize", "dataproto", "indexed", "matrix"])
+def test_raw_destination_retains_owner_for_output_views(read: str) -> None:
+    _store, transfer = make_transfer()
+    array = np.arange(24, dtype=np.int32)
+    if read == "matrix":
+        array = array.reshape(6, 4)
+    expected = array[[4, 1, 4]] if read in {"indexed", "matrix"} else array
+    releases = []
+
+    class Owner:
+        def __init__(self) -> None:
+            self.buffer = ctypes.create_string_buffer(expected.nbytes)
+
+    owner = Owner()
+    owner_ref = weakref.ref(owner)
+    weakref.finalize(owner, releases.append, "released")
+    pointer = ctypes.addressof(owner.buffer)
+    destination = raw_destination(pointer, expected.nbytes, owner)
+    if read == "materialize":
+        ref = transfer.put_structured_object(structured_payload(values=array))
+        result = transfer.materialize_into(
+            transfer.read_spec(ref), {"values": destination}
+        )
+        output = result.objects["values"]
+    else:
+        ref = transfer.put_dataproto(SimpleDataProto(batch={"values": array}))
+        kwargs = {"rows": [4, 1, 4]} if read in {"indexed", "matrix"} else {}
+        result = transfer.get_dataproto(
+            ref, destinations={"values": destination}, **kwargs
+        )
+        output = result["batch"]["values"]
+    assert output.ctypes.data == pointer
+    np.testing.assert_array_equal(output, expected)
+    sliced = output[1:]
+    asarray = np.asarray(output).view()
+
+    del owner, destination, result
+    gc.collect()
+    assert owner_ref() is not None
+    assert releases == []
+    del output
+    gc.collect()
+    assert owner_ref() is not None
+    np.testing.assert_array_equal(sliced, expected[1:])
+    del sliced
+    gc.collect()
+    assert owner_ref() is not None
+    np.testing.assert_array_equal(asarray, expected)
+    del asarray
+    gc.collect()
+    assert owner_ref() is None
+    assert releases == ["released"]
+
+
+@pytest.mark.parametrize("shape", [(), (0,), (2, 0)])
+def test_raw_destination_materialize_scalar_and_empty(shape: tuple[int, ...]) -> None:
+    _store, transfer = make_transfer()
+    array = np.zeros(shape, dtype=np.uint8)
+    ref = transfer.put_structured_object(structured_payload(values=array))
+    storage = ctypes.create_string_buffer(max(1, array.nbytes))
+    destination = raw_destination(ctypes.addressof(storage), array.nbytes, storage)
+
+    result = transfer.materialize_into(transfer.read_spec(ref), {"values": destination})
+
+    assert result.objects["values"].ctypes.data == ctypes.addressof(storage)
+    np.testing.assert_array_equal(result.objects["values"], array)
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_raw_destination_rejects_insufficient_size(indexed: bool) -> None:
+    _store, transfer = make_transfer()
+    array = np.arange(8, dtype=np.int32)
+    ref = transfer.put_dataproto(SimpleDataProto(batch={"values": array}))
+    storage = ctypes.create_string_buffer(array.nbytes)
+    destination = raw_destination(ctypes.addressof(storage), 1, storage)
+    kwargs = {"rows": [4, 1]} if indexed else {}
+
+    with pytest.raises(
+        ValueError, match="raw destination has 1 bytes, expected at least"
+    ):
+        transfer.get_dataproto(ref, destinations={"values": destination}, **kwargs)
 
 
 def test_structured_object_duplicate_destination_registration_is_tolerated() -> None:
