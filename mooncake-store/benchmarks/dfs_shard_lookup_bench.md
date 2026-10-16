@@ -9,10 +9,10 @@ Build with `BUILD_BENCHMARK=ON`, then run the same benchmark source against the 
 ```bash
 cmake --build build --target dfs_shard_lookup_bench
 build/mooncake-store/benchmarks/dfs_shard_lookup_bench \
-  --batch=64 --shards=1 --threads=1 --iterations=10000
+  --batch=64 --shards=1 --shard_pool=512 --threads=1 --iterations=10000
 ```
 
-Requests interleave `shards` distinct shard indices, including nonadjacent reuse. Sweep batch/shards/callers through `(1,1,1)`, `(16,1,1)`, `(64,1,1)`, `(64,4,1)`, `(64,64,1)`, `(64,1,4)`, `(64,4,4)` and `(64,64,4)`. Use at least 200,000 iterations for the short batch-1 control. Run five repetitions with alternating before/after order and fixed CPU affinity. `ns_per_batch` is elapsed wall time divided by all completed batches; with concurrent callers it is an aggregate service interval, not individual request latency. `cpu_ns_per_batch` sums caller thread CPU clocks and divides by completed batches. The benchmark warms every caller before starting the timers and checks every result.
+Requests interleave `shards` distinct shard indices, including nonadjacent reuse. `shard_pool` independently sets how many real shard files are opened into the persistent backend cache before timing; it defaults to `shards`. Thus a batch may repeatedly address one hot shard while the backend retains hundreds or thousands of other shard fds. Sweep batch/shards/callers through `(1,1,1)`, `(16,1,1)`, `(64,1,1)`, `(64,4,1)`, `(64,64,1)`, `(64,1,4)`, `(64,4,4)` and `(64,64,4)`, and sweep `shard_pool` independently across 64, 512 and 2,048 opened shards. Use at least 200,000 iterations for the short batch-1 control. Run five repetitions with alternating before/after order and fixed CPU affinity. `ns_per_batch` is elapsed wall time divided by all completed batches; with concurrent callers it is an aggregate service interval, not individual request latency. `cpu_ns_per_batch` sums caller thread CPU clocks and divides by completed batches. The benchmark opens all `shard_pool` files in an untimed warmup batch, then warms every caller before starting the timers and checks every result.
 
 ## Implementation and invariants
 
@@ -50,7 +50,27 @@ Successful warm shard resolutions and mutex acquisitions were independently coun
 | 64 | 64 | 1 | 6,400 → 6,400 | 12,800 → 12,800 |
 | 64 | 1 | 4 | 25,600 → 400 | 51,200 → 800 |
 
-For ordinary successful descriptors with one raw path per shard, N requests addressing U shards therefore resolve fds N → U times and acquire backend mutexes 2N → 2U times. These are backend resolution counts, not OS file-open counts: the existing persistent shard cache already avoids repeated successful opens. Lock waiting time and hardware CPU profiles were not measured; the four-caller cases exercise contention without isolating wait duration.
+The same results held with a 2,048-fd persistent cache: a single-shard working set resolved 6,400 → 100 times and acquired 12,800 → 200 mutexes; a 64-shard working set remained at 6,400 resolutions and 12,800 mutexes. For ordinary successful descriptors with one raw path per shard, N requests addressing U shards therefore resolve fds N → U times and acquire backend mutexes 2N → 2U times. These are backend resolution counts, not OS file-open counts: the existing persistent shard cache already avoids repeated successful opens. Lock waiting time and hardware CPU profiles were not measured; the four-caller cases exercise contention without isolating wait duration.
+
+## Larger persistent shard caches
+
+The second sweep separates the backend cache population from the batch working set. Before timing, it opens every file in `shard_pool` through the backend, retaining all fds and growing `shard_files_`; the measured batch then touches only the first 1, 4 or 64 shard indices. The base and candidate run the same modified benchmark source. Each cell is the median of five alternating before/after runs with 3,000 batches per caller.
+
+| Preopened shard fds | Batch working set | Callers | CPU µs/batch before → after | CPU change | Wall µs/batch before → after |
+| --- | --- | --- | --- | --- | --- |
+| 64 | 1 | 1 | 35.911 → 3.640 | -89.9% | 35.937 → 3.648 |
+| 64 | 4 | 1 | 36.239 → 5.231 | -85.6% | 36.259 → 5.235 |
+| 64 | 64 | 1 | 36.686 → 39.391 | +7.4% | 36.691 → 39.399 |
+| 512 | 1 | 1 | 36.119 → 3.747 | -89.6% | 36.124 → 3.752 |
+| 512 | 4 | 1 | 36.210 → 5.423 | -85.0% | 36.250 → 5.476 |
+| 512 | 64 | 1 | 36.691 → 39.413 | +7.4% | 36.766 → 39.422 |
+| 2048 | 1 | 1 | 36.694 → 3.574 | -90.3% | 36.706 → 3.580 |
+| 2048 | 4 | 1 | 36.433 → 5.213 | -85.7% | 36.505 → 5.218 |
+| 2048 | 64 | 1 | 36.454 → 39.436 | +8.2% | 36.461 → 39.451 |
+| 2048 | 1 | 4 | 40.769 → 3.628 | -91.1% | 10.877 → 1.462 |
+| 2048 | 64 | 4 | 38.879 → 41.901 | +7.8% | 10.069 → 10.755 |
+
+Increasing the persistent cache from 64 to 2,048 fds did not materially change the repeated-shard gain: one-shard batches saved 89.9%, 89.6% and 90.3% CPU at pools of 64, 512 and 2,048; four-shard batches saved 85.6%, 85.0% and 85.7%. Four callers with 2,048 cached fds saved 91.1% for a one-shard working set. All-distinct 64-shard batches paid 7.4%, 7.4% and 8.2% more CPU at the same pool sizes. Thus the benefit follows repeated shard identities within each batch; a larger idle shard population neither adds benefit nor erases it in this backend-only benchmark.
 
 ## Validation and scope
 

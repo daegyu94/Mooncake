@@ -4,6 +4,7 @@
 #include <glog/logging.h>
 #include <unistd.h>
 
+#include <array>
 #include <barrier>
 #include <chrono>
 #include <time.h>
@@ -20,6 +21,8 @@
 
 DEFINE_int32(batch, 64, "Requests per batch");
 DEFINE_int32(shards, 1, "Distinct shards, interleaved within each batch");
+DEFINE_int32(shard_pool, 0,
+             "Total cached shards to preopen (0 defaults to --shards)");
 DEFINE_int32(threads, 1, "Concurrent callers");
 DEFINE_int32(iterations, 10000, "Batches per caller");
 
@@ -53,6 +56,9 @@ int main(int argc, char** argv) {
     CHECK_GT(FLAGS_batch, 0);
     CHECK_GT(FLAGS_shards, 0);
     CHECK_LE(FLAGS_shards, FLAGS_batch);
+    const int shard_pool =
+        FLAGS_shard_pool == 0 ? FLAGS_shards : FLAGS_shard_pool;
+    CHECK_GE(shard_pool, FLAGS_shards);
     CHECK_GT(FLAGS_threads, 0);
     CHECK_GT(FLAGS_iterations, 0);
     TestDirectory directory;
@@ -63,7 +69,8 @@ int main(int argc, char** argv) {
     auto adapter = std::make_unique<NoTransferAdapter>();
     CHECK(adapter->Init(directory.path));
     std::vector<std::string> paths;
-    for (int i = 0; i < FLAGS_shards; ++i) {
+    paths.reserve(shard_pool);
+    for (int i = 0; i < shard_pool; ++i) {
         paths.push_back(directory.path + "/dfs_shard_" + (i < 10 ? "0" : "") +
                         std::to_string(i) + ".data");
         CHECK(adapter->PreallocateFile(paths.back(), config.shard_capacity));
@@ -72,6 +79,16 @@ int main(int argc, char** argv) {
     mooncake::DistributedStorageBackend backend(file_config, config,
                                                 std::move(adapter));
     CHECK(backend.Init());
+    std::vector<std::array<char, 4>> warm_buffers(shard_pool);
+    std::vector<mooncake::DfsReadRequest> warm_requests;
+    warm_requests.reserve(shard_pool);
+    for (int shard = 0; shard < shard_pool; ++shard) {
+        warm_requests.push_back(
+            {"warmup",
+             {paths[shard], 0, 4, 4096, shard},
+             {{warm_buffers[shard].data(), warm_buffers[shard].size()}}});
+    }
+    for (const auto& result : backend.BatchRead(warm_requests)) CHECK(result);
     std::barrier ready(FLAGS_threads + 1), start(FLAGS_threads + 1),
         finish(FLAGS_threads + 1);
     std::vector<double> cpu_times(FLAGS_threads);
@@ -115,7 +132,7 @@ int main(int argc, char** argv) {
     for (double time : cpu_times) cpu += time;
     const double batches = double(FLAGS_iterations) * FLAGS_threads;
     std::cout << "batch=" << FLAGS_batch << " shards=" << FLAGS_shards
-              << " threads=" << FLAGS_threads
+              << " shard_pool=" << shard_pool << " threads=" << FLAGS_threads
               << " ns_per_batch=" << elapsed * 1e9 / batches
               << " cpu_ns_per_batch=" << cpu * 1e9 / batches
               << " requests_per_second=" << batches * FLAGS_batch / elapsed
