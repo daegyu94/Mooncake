@@ -505,15 +505,32 @@ void DistributedStorageBackend::ExecuteShardBatchIo(
     std::vector<DfsIoOp*> io_ops;
     io_requests.reserve(ops.size());
     io_ops.reserve(ops.size());
+    // Batched adapters never reopen shard fds. Reuse successful resolutions
+    // only for the same shard index and raw path to preserve path validation.
+    std::unordered_map<int, std::pair<std::string_view, int>> resolved;
     for (auto& op : ops) {
-        auto shard = GetOrOpenShard(op.descriptor);
-        if (!shard) {
-            LOG(ERROR) << "Failed to open DFS shard for key " << op.key << ": "
-                       << shard.error();
-            results[op.index] = tl::make_unexpected(shard.error());
-            continue;
+        const auto& desc = op.descriptor;
+        auto cached = resolved.find(desc.shard_idx);
+        int fd;
+        if (cached != resolved.end() &&
+            cached->second.first == desc.file_path) {
+            fd = cached->second.second;
+        } else {
+            auto shard = GetOrOpenShard(desc);
+            if (!shard) {
+                LOG(ERROR) << "Failed to open DFS shard for key " << op.key
+                           << ": " << shard.error();
+                results[op.index] = tl::make_unexpected(shard.error());
+                continue;
+            }
+            fd = (*shard)->fd;
+            if (ops.size() > 1) {
+                resolved.insert_or_assign(
+                    desc.shard_idx,
+                    std::make_pair(std::string_view(desc.file_path), fd));
+            }
         }
-        io_requests.push_back({(*shard)->fd, op.iovs.data(),
+        io_requests.push_back({fd, op.iovs.data(),
                                static_cast<int>(op.iovs.size()),
                                static_cast<int64_t>(op.descriptor.offset)});
         io_ops.push_back(&op);

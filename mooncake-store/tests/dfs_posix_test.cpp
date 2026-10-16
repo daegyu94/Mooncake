@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -1102,6 +1103,211 @@ std::unique_ptr<DistributedStorageBackend> MakeControlledBackend(
     *out_adapter = adapter.get();
     return std::make_unique<DistributedStorageBackend>(
         file_config, distributed_config, std::move(adapter));
+}
+
+// Exercise the backend batch path with real positional I/O and fault injection.
+class BatchControlledPosixFsAdapter : public ControlledPosixFsAdapter {
+   public:
+    BatchControlledPosixFsAdapter() { SetSupportsFdReopen(false); }
+    bool SupportsBatchIo() const override { return true; }
+    std::vector<tl::expected<size_t, ErrorCode>> BatchWriteAt(
+        std::span<const FdIoRequest> requests) override {
+        return FileSystemAdapter::BatchWriteAt(requests);
+    }
+    std::vector<tl::expected<size_t, ErrorCode>> BatchReadAt(
+        std::span<const FdIoRequest> requests) override {
+        return FileSystemAdapter::BatchReadAt(requests);
+    }
+};
+
+class DfsShardBatchTest : public DfsBackendTest {
+   protected:
+    void SetUp() override {
+        DfsBackendTest::SetUp();
+        FileStorageConfig file_config;
+        DistributedStorageConfig config;
+        config.fsdir = tmp_->path();
+        config.shard_capacity = 64 * 1024 * 1024;
+        config.alignment = 4096;
+        auto adapter = std::make_unique<BatchControlledPosixFsAdapter>();
+        adapter_ = adapter.get();
+        backend_ = std::make_unique<DistributedStorageBackend>(
+            file_config, config, std::move(adapter));
+        ASSERT_TRUE(backend_->Init());
+    }
+
+    DistributedFSDescriptor Descriptor(int shard, uint64_t offset = 0) {
+        return {ShardPath(shard), offset, 4, 4096, shard};
+    }
+    BatchControlledPosixFsAdapter* adapter_ = nullptr;
+};
+
+TEST_F(DfsShardBatchTest, ReusesNonAdjacentShardsAndPreservesRequestOrder) {
+    std::vector<DfsWriteRequest> writes;
+    std::vector<DfsReadRequest> reads;
+    std::vector<std::string> values(16), output(16, std::string(4, '\0'));
+    for (int i = 0; i < 16; ++i) {
+        values[i] = std::string(4, 'a' + i);
+        auto desc = Descriptor(i % 4, (i / 4) * 4096);
+        writes.push_back({std::to_string(i), desc, {{values[i].data(), 4}}});
+        reads.push_back({std::to_string(i), desc, {{output[i].data(), 4}}});
+    }
+    for (const auto& result : backend_->BatchWrite(writes)) ASSERT_TRUE(result);
+    for (const auto& result : backend_->BatchRead(reads)) ASSERT_TRUE(result);
+    EXPECT_EQ(output, values);
+    EXPECT_EQ(adapter_->OpenCallCount(), 4);
+}
+
+TEST_F(DfsShardBatchTest, CacheDoesNotBypassDescriptorValidation) {
+    std::string value = "data";
+    auto good = Descriptor(0);
+    auto wrong_parent = good;
+    wrong_parent.file_path = "/dfs_shard_00.data";
+    auto wrong_name = good;
+    wrong_name.file_path = tmp_->file("dfs_shard_01.data");
+    auto alias = good;
+    alias.file_path = tmp_->path() + "/./dfs_shard_00.data";
+    auto negative = good;
+    negative.shard_idx = -1;
+    auto bad_range = good;
+    bad_range.offset = 1;
+    std::vector<DistributedFSDescriptor> descriptors{
+        good, wrong_parent, good, wrong_name, alias, good, negative, bad_range};
+    std::vector<DfsWriteRequest> writes;
+    std::vector<DfsReadRequest> reads;
+    for (const auto& desc : descriptors) {
+        writes.push_back({"key", desc, {{value.data(), 4}}});
+        reads.push_back({"key", desc, {{value.data(), 4}}});
+    }
+    auto write_results = backend_->BatchWrite(writes);
+    auto read_results = backend_->BatchRead(reads);
+    ASSERT_EQ(write_results.size(), descriptors.size());
+    ASSERT_EQ(read_results.size(), descriptors.size());
+    for (size_t i = 0; i < descriptors.size(); ++i) {
+        const bool valid = i == 0 || i == 2 || i == 4 || i == 5;
+        EXPECT_EQ(write_results[i].has_value(), valid) << i;
+        EXPECT_EQ(read_results[i].has_value(), valid) << i;
+        if (!valid) {
+            EXPECT_EQ(write_results[i].error(), ErrorCode::INVALID_PARAMS);
+            EXPECT_EQ(read_results[i].error(), ErrorCode::INVALID_PARAMS);
+        }
+    }
+}
+
+TEST_F(DfsShardBatchTest, RejectsAlternatePreparedFileForTheSameShardIndex) {
+    std::string value = "data";
+    auto alternate = Descriptor(0);
+    alternate.file_path = tmp_->file("dfs_shard_0000.data");
+    ASSERT_TRUE(
+        adapter_->PreallocateFile(alternate.file_path, 64 * 1024 * 1024));
+    auto results =
+        backend_->BatchRead({{"first", Descriptor(0), {{value.data(), 4}}},
+                             {"alternate", alternate, {{value.data(), 4}}},
+                             {"cached", Descriptor(0), {{value.data(), 4}}}});
+    ASSERT_EQ(results.size(), 3);
+    EXPECT_TRUE(results[0]);
+    ASSERT_FALSE(results[1]);
+    EXPECT_EQ(results[1].error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_TRUE(results[2]);
+    EXPECT_EQ(adapter_->OpenCallCount(), 1);
+}
+
+TEST_F(DfsShardBatchTest, FailedOpenIsRetriedWithinTheBatch) {
+    std::string value = "data";
+    auto desc = Descriptor(0);
+    adapter_->FailOpenCall(1);
+    auto results =
+        backend_->BatchWrite({{"first", desc, {{value.data(), 4}}},
+                              {"retry", desc, {{value.data(), 4}}},
+                              {"cached", desc, {{value.data(), 4}}}});
+    ASSERT_EQ(results.size(), 3);
+    ASSERT_FALSE(results[0]);
+    EXPECT_EQ(results[0].error(), ErrorCode::FILE_OPEN_FAIL);
+    EXPECT_TRUE(results[1]);
+    EXPECT_TRUE(results[2]);
+    EXPECT_EQ(adapter_->OpenCallCount(), 2);
+    auto reads = backend_->BatchRead({{"key", desc, {{value.data(), 4}}}});
+    ASSERT_TRUE(reads[0]);
+    EXPECT_EQ(value, "data");
+}
+
+TEST_F(DfsShardBatchTest, FailedReadOpenIsRetriedWithinTheBatch) {
+    std::string output(4, 'x');
+    auto desc = Descriptor(0);
+    adapter_->FailOpenCall(1);
+    auto results =
+        backend_->BatchRead({{"first", desc, {{output.data(), 4}}},
+                             {"retry", desc, {{output.data(), 4}}},
+                             {"cached", desc, {{output.data(), 4}}}});
+    ASSERT_EQ(results.size(), 3);
+    ASSERT_FALSE(results[0]);
+    EXPECT_EQ(results[0].error(), ErrorCode::FILE_OPEN_FAIL);
+    EXPECT_TRUE(results[1]);
+    EXPECT_TRUE(results[2]);
+    EXPECT_EQ(adapter_->OpenCallCount(), 2);
+    EXPECT_EQ(output, std::string(4, '\0'));
+}
+
+TEST_F(DfsShardBatchTest, PreservesErrorsAndShortTransfersOnCachedFd) {
+    std::string value = "data";
+    std::vector<DfsWriteRequest> writes;
+    std::vector<DfsReadRequest> reads;
+    for (int i = 0; i < 3; ++i) {
+        auto desc = Descriptor(0, i * 4096);
+        writes.push_back({"key", desc, {{value.data(), 4}}});
+        reads.push_back({"key", desc, {{value.data(), 4}}});
+    }
+    adapter_->FailWriteAtOffset(4096);
+    adapter_->ShortWriteAtOffset(8192);
+    auto written = backend_->BatchWrite(writes);
+    ASSERT_TRUE(written[0]);
+    for (int i : {1, 2}) {
+        ASSERT_FALSE(written[i]);
+        EXPECT_EQ(written[i].error(), ErrorCode::FILE_WRITE_FAIL);
+    }
+    adapter_->FailReadAtOffset(4096);
+    adapter_->ShortReadAtOffset(8192);
+    auto read = backend_->BatchRead(reads);
+    ASSERT_TRUE(read[0]);
+    for (int i : {1, 2}) {
+        ASSERT_FALSE(read[i]);
+        EXPECT_EQ(read[i].error(), ErrorCode::FILE_READ_FAIL);
+    }
+    EXPECT_EQ(adapter_->OpenCallCount(), 1);
+    EXPECT_EQ(adapter_->ReadCallCount(), 3);
+    EXPECT_EQ(adapter_->WriteCallCount(), 3);
+}
+
+TEST_F(DfsShardBatchTest, ConcurrentLazyOpenAndExpansionPreserveData) {
+    // Publish another prepared shard after backend initialization.
+    ASSERT_TRUE(adapter_->PreallocateFile(ShardPath(4), 64 * 1024 * 1024));
+    std::barrier start(8);
+    std::vector<std::future<bool>> workers;
+    for (int worker = 0; worker < 8; ++worker) {
+        workers.push_back(std::async(std::launch::async, [&, worker] {
+            std::string value(4, 'a' + worker);
+            std::vector<std::string> output(10, std::string(4, '\0'));
+            std::vector<DfsWriteRequest> writes;
+            std::vector<DfsReadRequest> reads;
+            for (int i = 0; i < 10; ++i) {
+                auto desc = Descriptor(i % 5, (worker * 2 + i / 5) * 4096);
+                writes.push_back({"key", desc, {{value.data(), 4}}});
+                reads.push_back({"key", desc, {{output[i].data(), 4}}});
+            }
+            start.arrive_and_wait();
+            for (int repeat = 0; repeat < 20; ++repeat) {
+                for (const auto& result : backend_->BatchWrite(writes))
+                    if (!result) return false;
+                for (const auto& result : backend_->BatchRead(reads))
+                    if (!result) return false;
+                for (const auto& bytes : output)
+                    if (bytes != value) return false;
+            }
+            return true;
+        }));
+    }
+    for (auto& worker : workers) EXPECT_TRUE(worker.get());
+    EXPECT_EQ(adapter_->OpenCallCount(), 5);
 }
 
 class BlockingShardFsAdapter : public PosixFsAdapter {
