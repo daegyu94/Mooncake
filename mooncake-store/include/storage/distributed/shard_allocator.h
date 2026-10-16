@@ -129,6 +129,9 @@ class ShardAllocator final : public DfsAllocatorInterface {
             bool eviction_prepared = false;
         };
 
+        // Advisory exact-size failure hint. Allocations can skip nonpreferred
+        // shards without taking handle_mutex, but always retry before failure.
+        std::atomic<uint64_t> failed_allocation_size{0};
         std::shared_mutex handle_mutex;
         std::unordered_map<uint64_t, AllocationRecord> offset_to_handle;
 

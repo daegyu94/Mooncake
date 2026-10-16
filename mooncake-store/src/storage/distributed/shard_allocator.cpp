@@ -275,17 +275,24 @@ tl::expected<DistributedFSDescriptor, ErrorCode> ShardAllocator::Allocate(
     const auto shards =
         std::atomic_load_explicit(&shards_, std::memory_order_acquire);
     const size_t preferred = std::hash<std::string>{}(key) % shards->size();
-    // A full preferred shard must not hide capacity in newly appended shards.
-    // Existing descriptors remain authoritative even when the modulo changes.
-    for (size_t attempt = 0; attempt < shards->size(); ++attempt) {
-        const size_t shard_idx = (preferred + attempt) % shards->size();
+    auto try_allocate = [&](size_t shard_idx)
+        -> tl::expected<DistributedFSDescriptor, ErrorCode> {
         auto& shard = *(*shards)[shard_idx];
         std::unique_lock handle_lock(shard.handle_mutex);
         CleanupExpiredPendingFrees(shard, std::chrono::steady_clock::now());
         const uint64_t reserved_bytes =
             shard.allocator->normalizedAllocationSize(allocation_size);
         auto handle = shard.allocator->allocate(allocation_size);
-        if (!handle) continue;
+        if (!handle) {
+            // A pending handle may become reusable merely as time passes.
+            // Keep probing until it has been reclaimed, rather than hiding
+            // it behind a hint that no subsequent Free() will invalidate.
+            if (shard.pending_free.empty()) {
+                shard.failed_allocation_size.store(allocation_size,
+                                                   std::memory_order_relaxed);
+            }
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
 
         const uint64_t alloc_offset = AlignSize(handle->address());
         auto alloc_handle =
@@ -295,6 +302,27 @@ tl::expected<DistributedFSDescriptor, ErrorCode> ShardAllocator::Allocate(
         return DistributedFSDescriptor{shard.path, alloc_offset, size,
                                        aligned_size,
                                        static_cast<int>(shard_idx)};
+    };
+
+    std::vector<size_t> skipped;
+    for (size_t attempt = 0; attempt < shards->size(); ++attempt) {
+        const size_t shard_idx = (preferred + attempt) % shards->size();
+        const auto& shard = *(*shards)[shard_idx];
+        // Keep preferred placement unchanged and cache exact sizes only.
+        if (attempt != 0 && shard.failed_allocation_size.load(
+                                std::memory_order_relaxed) == allocation_size) {
+            if (skipped.empty()) skipped.reserve(shards->size());
+            skipped.push_back(shard_idx);
+            continue;
+        }
+        auto result = try_allocate(shard_idx);
+        if (result) return result;
+    }
+    // Record skipped indices rather than rereading mutable hints: a concurrent
+    // free can invalidate a hint, and must not make us miss available capacity.
+    for (size_t shard_idx : skipped) {
+        auto result = try_allocate(shard_idx);
+        if (result) return result;
     }
     return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
 }
@@ -589,6 +617,7 @@ void ShardAllocator::QueuePendingFree(
     ShardState& shard, const std::shared_ptr<OffsetAllocationHandle>& handle,
     uint64_t bytes, std::chrono::steady_clock::time_point when) {
     if (!handle) return;
+    shard.failed_allocation_size.store(0, std::memory_order_relaxed);
     std::lock_guard pending_lock(shard.pending_mutex);
     if (bytes == 0) bytes = handle->size();
     shard.pending_free.push_back({handle, bytes, when});
@@ -600,6 +629,7 @@ void ShardAllocator::CleanupExpiredPendingFrees(
     std::lock_guard pending_lock(shard.pending_mutex);
     while (!shard.pending_free.empty() &&
            shard.pending_free.front().when <= now) {
+        shard.failed_allocation_size.store(0, std::memory_order_relaxed);
         const uint64_t bytes = shard.pending_free.front().bytes;
         shard.pending_free.pop_front();
         if (bytes > shard.pending_free_bytes) {

@@ -334,6 +334,99 @@ TEST(ShardAllocatorTest, AllocateFreeAndFormatShardIdx) {
     EXPECT_EQ(ShardAllocator::FormatShardIdx(100, 1000), "100");
 }
 
+// Small capacities make each 4 KiB allocation consume a whole shard (including
+// alignment padding). Repeated exhaustion primes exact-size failure hints.
+TEST(ShardAllocatorTest, FailureHintsDoNotHideImmediateOrDeferredFrees) {
+    for (int delay : {0, 1}) {
+        SCOPED_TRACE(delay);
+        EnvGuard env;
+        ConfigurePosixDfs(env);
+        TempDir tmp("dfs_failure_hint_free");
+        auto config = MakeAllocatorConfig(tmp.path(), 3, 8192, 4096);
+        config.deferred_free_duration = std::chrono::seconds(delay);
+        ShardAllocator alloc;
+        ASSERT_TRUE(alloc.Init(config));
+        std::vector<DistributedFSDescriptor> allocated;
+        for (int i = 0; i < 3; ++i) {
+            auto result = alloc.Allocate("fill" + std::to_string(i), 4096);
+            ASSERT_TRUE(result);
+            allocated.push_back(*result);
+        }
+        EXPECT_FALSE(alloc.Allocate("probe", 4096));
+        EXPECT_FALSE(alloc.Allocate("probe", 4096));
+        alloc.Free("fill1", allocated[1]);
+        if (delay) {
+            EXPECT_FALSE(alloc.Allocate("probe", 4096));
+            std::this_thread::sleep_for(std::chrono::seconds(delay) +
+                                        std::chrono::milliseconds(20));
+        }
+        auto result = alloc.Allocate("probe", 4096);
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result->shard_idx, allocated[1].shard_idx);
+    }
+}
+
+TEST(ShardAllocatorTest, StaleFailureHintFallsBackAfterPinnedHandleRelease) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_stale_failure_hint");
+    auto config = MakeAllocatorConfig(tmp.path(), 2, 8192, 4096);
+    config.deferred_free_duration = std::chrono::seconds(0);
+    ShardAllocator alloc;
+    ASSERT_TRUE(alloc.Init(config));
+    for (int i = 0; i < 2; ++i) {
+        const auto key = "pinned" + std::to_string(i);
+        auto result = alloc.Allocate(key, 4096);
+        ASSERT_TRUE(result);
+        alloc.UpdateAccess(key, *result);
+    }
+    auto pending = alloc.PrepareEviction();
+    ASSERT_FALSE(pending.Empty());
+    const auto victim = pending.Candidates().front();
+    alloc.Free(victim.offset, 4096, victim.shard_idx, victim.key);
+    std::string probe = "probe";
+    while (std::hash<std::string>{}(probe) % 2 ==
+           static_cast<size_t>(victim.shard_idx))
+        probe += 'x';
+    // Reclaim the deferred queue, but PendingEviction still pins the handle.
+    // The unsuccessful scan now leaves a hint on the victim's shard.
+    EXPECT_FALSE(alloc.Allocate(probe, 4096));
+    alloc.RestorePreparedEviction(std::move(pending));
+    // The last pin disappears without another Free(). A stale hint must not
+    // turn that newly reusable capacity into a false allocation failure.
+    auto result = alloc.Allocate(probe, 4096);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->shard_idx, victim.shard_idx);
+}
+
+TEST(ShardAllocatorTest, FailureHintsAreExactSizeAndExpansionFindsCapacity) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_failure_hint_sizes");
+    ShardAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 2, 16384, 4096)));
+    for (size_t shard = 0; shard < 2; ++shard) {
+        std::string key = "initial";
+        while (std::hash<std::string>{}(key) % 2 != shard) key += 'x';
+        auto result = alloc.Allocate(key, 4096);
+        ASSERT_TRUE(result);
+        ASSERT_EQ(result->shard_idx, shard);
+    }
+    // A failed large request must not suppress a smaller allocatable request.
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_FALSE(alloc.Allocate("large", 12288));
+    }
+    EXPECT_TRUE(alloc.Allocate("small", 4096));
+    EXPECT_TRUE(alloc.Allocate("other", 4096));
+    while (alloc.Allocate("fill", 4096)) {
+    }
+    EXPECT_FALSE(alloc.Allocate("probe", 4096));
+    ASSERT_TRUE(alloc.ExpandShards(3));
+    auto added = alloc.Allocate("probe", 4096);
+    ASSERT_TRUE(added);
+    EXPECT_EQ(added->shard_idx, 2);
+}
+
 TEST(ShardAllocatorTest, InitReturnsSpecificErrors) {
     EnvGuard env;
     ConfigurePosixDfs(env);
