@@ -705,6 +705,18 @@ DistributedStorageBackend::BatchWrite(
 
 std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     const std::vector<DfsReadRequest>& requests) {
+    return BatchReadImpl(std::span<const DfsReadRequest>(requests));
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+DistributedStorageBackend::BatchReadViews(
+    std::span<const DfsReadRequestView> requests) {
+    return BatchReadImpl(requests);
+}
+
+template <typename Request>
+std::vector<tl::expected<void, ErrorCode>>
+DistributedStorageBackend::BatchReadImpl(std::span<const Request> requests) {
     std::vector<tl::expected<void, ErrorCode>> results(requests.size());
 
     if (UsesObjectStorage()) {

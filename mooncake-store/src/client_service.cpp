@@ -1700,7 +1700,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     std::vector<std::tuple<size_t, std::string, TransferFuture,
                            Replica::Descriptor, bool>>
         pending_transfers;
-    std::vector<DfsReadRequest> dfs_read_requests;
+    std::vector<DfsReadRequestView> dfs_read_requests;
     std::vector<size_t> dfs_read_indices;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
     // Record batch get transfer latency (Submit + Wait)
@@ -1721,17 +1721,34 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             continue;
         }
 
-        // Find the first complete replica for this key
-        Replica::Descriptor replica;
-        ErrorCode err =
-            FindFirstCompleteReplica(query_result.replicas, replica);
-        if (err != ErrorCode::OK) {
-            if (err == ErrorCode::INVALID_REPLICA) {
-                LOG(ERROR) << "no_complete_replicas_found key=" << key;
-            }
-            results[i] = tl::unexpected(err);
+        // Borrow DFS metadata from query_results, which outlives the
+        // synchronous batch read. A loop-local replica copy would not.
+        const auto replica_it = std::find_if(
+            query_result.replicas.begin(), query_result.replicas.end(),
+            [](const auto& candidate) {
+                return candidate.status == ReplicaStatus::COMPLETE;
+            });
+        if (replica_it == query_result.replicas.end()) {
+            LOG(ERROR) << "no_complete_replicas_found key=" << key;
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
             continue;
         }
+        if (replica_it->is_dfs_replica()) {
+            if (!dfs_storage_backend_) {
+                LOG(ERROR) << "DFS backend is not initialized";
+                if (auto* dfs_metric = GetDfsMetricPtr()) {
+                    dfs_metric->RecordReadErrors(
+                        toString(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+                }
+                results[i] = tl::unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+                continue;
+            }
+            dfs_read_requests.push_back(
+                {key, replica_it->get_dfs_descriptor(), slices_it->second});
+            dfs_read_indices.push_back(i);
+            continue;
+        }
+        Replica::Descriptor replica = *replica_it;
 
         bool cache_used = false;
         if (hot_cache_ && replica.is_memory_replica()) {
@@ -1743,22 +1760,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         // Submit transfer operation asynchronously
         std::optional<TransferFuture> future;
-        if (replica.is_dfs_replica()) {
-            if (!dfs_storage_backend_) {
-                LOG(ERROR) << "DFS backend is not initialized";
-                if (auto* dfs_metric = GetDfsMetricPtr()) {
-                    dfs_metric->RecordReadErrors(
-                        toString(ErrorCode::DFS_SERVICE_UNAVAILABLE));
-                }
-                results[i] = tl::unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-                continue;
-            }
-            const auto& desc = replica.get_dfs_descriptor();
-            dfs_read_requests.push_back(
-                DfsReadRequest{key, desc, slices_it->second});
-            dfs_read_indices.push_back(i);
-            continue;
-        } else if (replica.is_nof_replica()) {
+        if (replica.is_nof_replica()) {
             auto contiguous_range = GetContiguousSliceRange(slices_it->second);
             if (!contiguous_range.has_value()) {
                 LOG(ERROR) << "NoF transfer requires contiguous slices";
@@ -1795,7 +1797,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     if (!dfs_read_requests.empty()) {
         auto* dfs_metric = GetDfsMetricPtr();
         const auto dfs_read_start = std::chrono::steady_clock::now();
-        auto dfs_results = dfs_storage_backend_->BatchRead(dfs_read_requests);
+        auto dfs_results =
+            dfs_storage_backend_->BatchReadViews(dfs_read_requests);
         const auto dfs_read_latency_us = elapsed_us_since(dfs_read_start);
         int64_t dfs_success_keys = 0;
         uint64_t dfs_success_bytes = 0;
@@ -1834,9 +1837,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 // distinguishable.
                 ++dfs_success_keys;
                 dfs_success_bytes += request.descriptor.object_size;
-                auto checksum_result = VerifyObjectChecksum(
-                    request.key, request.slices, request.descriptor.object_size,
-                    query_results[index].object_checksum);
+                auto checksum_result =
+                    VerifyObjectChecksum(request.key, slices.at(request.key),
+                                         request.descriptor.object_size,
+                                         query_results[index].object_checksum);
                 if (!checksum_result) {
                     if (dfs_metric) {
                         dfs_metric->RecordReadErrors(

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -32,6 +33,15 @@ struct DfsReadRequest {
     std::string key;
     DistributedFSDescriptor descriptor;
     std::vector<Slice> slices;
+};
+
+// Borrowed metadata for synchronous reads. All referenced keys, descriptors,
+// slice arrays and destination buffers must remain alive through
+// BatchReadViews.
+struct DfsReadRequestView {
+    const std::string& key;
+    const DistributedFSDescriptor& descriptor;
+    std::span<const Slice> slices;
 };
 
 /**
@@ -77,6 +87,9 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::vector<tl::expected<void, ErrorCode>> BatchRead(
         const std::vector<DfsReadRequest>& requests);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchReadViews(
+        std::span<const DfsReadRequestView> requests);
+
     // Key-only storage backend operations cannot safely address DFS objects;
     // callers must use BatchRead/BatchWrite with request-scoped descriptors.
     tl::expected<void, ErrorCode> BatchLoad(
@@ -95,6 +108,10 @@ class DistributedStorageBackend : public StorageBackendInterface {
     static constexpr size_t kMaxOpenBucketsPerBatch = 64;
 
    private:
+    template <typename Request>
+    std::vector<tl::expected<void, ErrorCode>> BatchReadImpl(
+        std::span<const Request> requests);
+
     struct ShardFile {
         std::string path;
         int fd = -1;

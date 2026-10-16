@@ -977,6 +977,66 @@ class DfsBackendTest : public ::testing::Test {
     std::unique_ptr<DistributedStorageBackend> backend_;
 };
 
+class ViewBatchPosixAdapter : public PosixFsAdapter {
+   public:
+    bool SupportsBatchIo() const override { return true; }
+};
+
+TEST_F(DfsBackendTest, BorrowedReadsMatchOwningRequestsInBothExecutionModes) {
+    for (bool batch_io : {false, true}) {
+        SCOPED_TRACE(batch_io);
+        FileStorageConfig file_config;
+        file_config.storage_backend_type = StorageBackendType::kDistributed;
+        file_config.storage_filepath = tmp_->path();
+        auto config =
+            MakeAllocatorConfig(tmp_->path(), 4, 64 * 1024 * 1024, 4096);
+        config.fs_adapter_type = "posix";
+        std::unique_ptr<FileSystemAdapter> adapter;
+        if (batch_io)
+            adapter = std::make_unique<ViewBatchPosixAdapter>();
+        else
+            adapter = std::make_unique<PosixFsAdapter>();
+        backend_ = std::make_unique<DistributedStorageBackend>(
+            file_config, config, std::move(adapter));
+        ASSERT_TRUE(backend_->Init());
+        EXPECT_TRUE(backend_->BatchReadViews({}).empty());
+
+        std::string input(4096, 'B'), output(4096, '\0');
+        DistributedFSDescriptor descriptor{ShardPath(0), 0, 4096, 4096, 0};
+        ASSERT_TRUE(backend_->BatchWrite(
+            {{"key", descriptor, {{input.data(), input.size()}}}})[0]);
+        std::vector<DfsReadRequest> owning{
+            {"a long key that exceeds small string optimization",
+             descriptor,
+             {{output.data(), 1024}, {output.data() + 1024, 3072}}},
+            {"invalid", descriptor, {{nullptr, 4096}}},
+            {"short", descriptor, {{output.data(), 1}}}};
+        auto invalid_descriptor = descriptor;
+        invalid_descriptor.offset = 1;
+        owning.push_back({"invalid range",
+                          invalid_descriptor,
+                          {{output.data(), output.size()}}});
+        auto expected = backend_->BatchRead(owning);
+        ASSERT_EQ(expected.size(), owning.size());
+        EXPECT_TRUE(expected[0]);
+        EXPECT_EQ(output, input);
+        std::fill(output.begin(), output.end(), '\0');
+        // Build only after owners have their final positions. Reallocation of
+        // the view array itself must not invalidate referenced metadata.
+        std::vector<DfsReadRequestView> views;
+        for (const auto& request : owning) {
+            views.push_back({request.key, request.descriptor, request.slices});
+        }
+        auto actual = backend_->BatchReadViews(views);
+        ASSERT_EQ(actual.size(), expected.size());
+        EXPECT_EQ(output, input);
+        for (size_t i = 0; i < actual.size(); ++i) {
+            ASSERT_EQ(actual[i].has_value(), expected[i].has_value());
+            if (!actual[i]) EXPECT_EQ(actual[i].error(), expected[i].error());
+        }
+    }
+}
+
 class ControlledPosixFsAdapter : public PosixFsAdapter {
    public:
     void FailOpenCall(int call) { fail_open_call_ = call; }
