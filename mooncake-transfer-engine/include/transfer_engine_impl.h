@@ -204,6 +204,8 @@ class TransferEngineImpl {
         // store notify
         RWSpinlock::WriteGuard guard(send_notifies_lock_);
         notifies_to_send_[batch_id] = std::make_pair(target_id, notify_msg);
+        pending_notifies_.store(notifies_to_send_.size(),
+                                std::memory_order_release);
 
         return s;
     }
@@ -266,6 +268,8 @@ class TransferEngineImpl {
         // store notify
         RWSpinlock::WriteGuard guard(send_notifies_lock_);
         notifies_to_send_[batch_id] = std::make_pair(target_id, notify_msg);
+        pending_notifies_.store(notifies_to_send_.size(),
+                                std::memory_order_release);
 
         return s;
     }
@@ -284,8 +288,11 @@ class TransferEngineImpl {
         return multi_transports_->freeBatchID(batch_id, [this, batch_id] {
             // BatchID is pointer-derived. Remove side-table state before the
             // descriptor is deleted and its address can be reused.
+            if (pending_notifies_.load(std::memory_order_acquire) == 0) return;
             RWSpinlock::WriteGuard guard(send_notifies_lock_);
             notifies_to_send_.erase(batch_id);
+            pending_notifies_.store(notifies_to_send_.size(),
+                                    std::memory_order_release);
         });
     }
 
@@ -381,7 +388,8 @@ class TransferEngineImpl {
             }
         }
 #endif
-        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+        if (result.ok() && status.s == TransferStatusEnum::COMPLETED &&
+            pending_notifies_.load(std::memory_order_acquire) != 0) {
             std::pair<SegmentID, TransferMetadata::NotifyDesc> value;
             {
                 RWSpinlock::WriteGuard guard(send_notifies_lock_);
@@ -389,6 +397,8 @@ class TransferEngineImpl {
                 if (notify == notifies_to_send_.end()) return result;
                 value = std::move(notify->second);
                 notifies_to_send_.erase(notify);
+                pending_notifies_.store(notifies_to_send_.size(),
+                                        std::memory_order_release);
             }
             auto rc = sendNotifyByID(value.first, std::move(value.second));
             if (rc) {
@@ -513,6 +523,10 @@ class TransferEngineImpl {
     std::unordered_map<BatchID,
                        std::pair<SegmentID, TransferMetadata::NotifyDesc>>
         notifies_to_send_;
+    // Size of notifies_to_send_, written under send_notifies_lock_. Most
+    // batches never carry a notify, so status polling and freeBatchID skip
+    // the process-wide write lock while it is zero.
+    std::atomic<size_t> pending_notifies_{0};
 
     std::string autoDiscoverTransport() const {
         if (use_barex_) {

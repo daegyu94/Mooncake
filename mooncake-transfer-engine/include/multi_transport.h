@@ -15,6 +15,7 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <map>
@@ -139,6 +140,9 @@ class MultiTransport {
     std::condition_variable deferred_cleanup_cv_;
     std::unordered_map<BatchID, std::function<void()>>
         deferred_cleanup_batches_;
+    // Size of deferred_cleanup_batches_, written under deferred_cleanup_mutex_
+    // so freeBatchID can skip the mutex while no batch is deferred.
+    std::atomic<size_t> deferred_cleanup_count_{0};
     bool stop_deferred_cleanup_ = false;
     std::thread deferred_cleanup_thread_;
 };

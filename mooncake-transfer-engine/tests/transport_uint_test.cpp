@@ -123,6 +123,10 @@ class TransferEngineImplTestPeer {
         return engine.notifies_to_send_.size();
     }
 
+    static size_t pendingNotifyHint(TransferEngineImpl& engine) {
+        return engine.pending_notifies_.load();
+    }
+
     static Status freeBatchWithCallback(
         TransferEngineImpl& engine, BatchID batch_id,
         const std::function<void()>& before_delete) {
@@ -199,6 +203,10 @@ class TransferEngineImplTestPeer {
                                   Transport::BatchID batch_id) {
         std::lock_guard<std::mutex> guard(transport.deferred_cleanup_mutex_);
         return transport.deferred_cleanup_batches_.count(batch_id) != 0;
+    }
+
+    static size_t deferredCleanupCount(MultiTransport& transport) {
+        return transport.deferred_cleanup_count_.load();
     }
 };
 
@@ -792,6 +800,20 @@ class TerminalFailureTransport : public BatchResultTransport {
     std::vector<TransferTask*> tasks_;
 };
 
+class CompletedTransport : public BatchResultTransport {
+   public:
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        for (auto* task : tasks) task->slice_count = 1;
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        status.s = TransferStatusEnum::COMPLETED;
+        return Status::OK();
+    }
+};
+
 enum class ScatterPollFailure { kStatusError, kTimeout };
 
 class ScatterDrainProbeTransport : public BatchResultTransport {
@@ -1196,6 +1218,45 @@ TEST_F(TransportTest, TimedOutBatchIsReclaimedAfterCallbacksFinish) {
     EXPECT_FALSE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
                                                                batch_id));
     EXPECT_TRUE(callback_called.load(std::memory_order_acquire));
+}
+
+TEST_F(TransportTest, FreeOtherBatchWhileOneIsDeferred) {
+    std::string server_name = "unit-test-server:1234";
+    TimeoutThenFailureTransport task_transport;
+    MultiTransport multi_transport(nullptr, server_name);
+    auto busy_batch = multi_transport.allocateBatchID(1);
+    TransferEngineImplTestPeer::prepareBusyBatch(multi_transport, busy_batch,
+                                                 &task_transport);
+    ASSERT_TRUE(
+        multi_transport.freeBatchID(busy_batch).IsBatchCleanupDeferred());
+    EXPECT_EQ(TransferEngineImplTestPeer::deferredCleanupCount(multi_transport),
+              1u);
+
+    // A second free of the deferred batch is still rejected.
+    Status repeat_status = multi_transport.freeBatchID(busy_batch);
+    EXPECT_TRUE(repeat_status.IsBatchCleanupDeferred());
+    EXPECT_EQ(repeat_status.message(),
+              "BatchID is invalid because cleanup has already been deferred");
+
+    // Other batches are freed immediately while one is deferred.
+    auto idle_batch = multi_transport.allocateBatchID(1);
+    EXPECT_TRUE(multi_transport.freeBatchID(idle_batch).ok());
+
+    task_transport.fail();
+    constexpr auto kCleanupDeadline = std::chrono::seconds(2);
+    const auto deadline = std::chrono::steady_clock::now() + kCleanupDeadline;
+    while (TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                         busy_batch) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_FALSE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                               busy_batch));
+    EXPECT_EQ(TransferEngineImplTestPeer::deferredCleanupCount(multi_transport),
+              0u);
+
+    auto next_batch = multi_transport.allocateBatchID(1);
+    EXPECT_TRUE(multi_transport.freeBatchID(next_batch).ok());
 }
 
 TEST_F(TransportTest, FinishedBatchWaitsForCompletionCallbackQuiescence) {
@@ -1626,6 +1687,54 @@ TEST_F(TransportTest, BusyBatchKeepsPendingNotify) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 0);
+}
+
+TEST_F(TransportTest, CompletedBatchConsumesOnlyItsOwnNotify) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<CompletedTransport>();
+    TransferEngineImplTestPeer::replaceTransports(engine,
+                                                  {{"completed", transport}});
+
+    constexpr SegmentID kSegmentId = 12;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "completed";
+    engine.getMetadata()->addLocalSegment(kSegmentId, "remote",
+                                          std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    TransferRequest request{.opcode = TransferRequest::READ,
+                            .source = buffer.data(),
+                            .target_id = kSegmentId,
+                            .target_offset = 0,
+                            .length = buffer.size()};
+    auto plain = engine.allocateBatchID(1);
+    ASSERT_TRUE(engine.submitTransfer(plain, {request}).ok());
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyHint(engine), 0);
+
+    auto with_notify = engine.allocateBatchID(1);
+    ASSERT_TRUE(engine
+                    .submitTransferWithNotify(with_notify, {request},
+                                              {"name", "payload"})
+                    .ok());
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyHint(engine), 1);
+
+    // Completing and freeing a batch without a notify leaves the other
+    // batch's notify pending.
+    TransferStatus status;
+    ASSERT_TRUE(engine.getTransferStatus(plain, 0, status).ok());
+    ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    ASSERT_TRUE(engine.freeBatchID(plain).ok());
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 1);
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyHint(engine), 1);
+
+    // Completing the notify batch consumes its notify.
+    ASSERT_TRUE(engine.getTransferStatus(with_notify, 0, status).ok());
+    ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 0);
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyHint(engine), 0);
+    ASSERT_TRUE(engine.freeBatchID(with_notify).ok());
 }
 
 TEST_F(TransportTest, BatchCleanupRunsAfterBeforeDeleteCallback) {

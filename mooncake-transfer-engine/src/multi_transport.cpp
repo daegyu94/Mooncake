@@ -125,10 +125,14 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
 
 Status MultiTransport::freeBatchID(BatchID batch_id,
                                    const std::function<void()>& before_delete) {
-    std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
-    if (deferred_cleanup_batches_.count(batch_id) != 0) {
-        return Status::BatchCleanupDeferred(
-            "BatchID is invalid because cleanup has already been deferred");
+    // Only deferred batches are shared with the cleanup thread. A batch that
+    // is not deferred belongs to the caller, so free it without the mutex.
+    if (deferred_cleanup_count_.load(std::memory_order_acquire) != 0) {
+        std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
+        if (deferred_cleanup_batches_.count(batch_id) != 0) {
+            return Status::BatchCleanupDeferred(
+                "BatchID is invalid because cleanup has already been deferred");
+        }
     }
 
     Status status = tryFreeBatchID(batch_id, before_delete);
@@ -136,7 +140,10 @@ Status MultiTransport::freeBatchID(BatchID batch_id,
         return status;
     }
 
+    std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
     deferred_cleanup_batches_.emplace(batch_id, before_delete);
+    deferred_cleanup_count_.store(deferred_cleanup_batches_.size(),
+                                  std::memory_order_release);
     if (!deferred_cleanup_thread_.joinable()) {
         // Start the cleanup worker lazily after taking ownership of a busy
         // batch. BatchCleanupDeferred tells callers that in-flight transport
@@ -230,6 +237,8 @@ void MultiTransport::deferredCleanupLoop() {
                 ++it;
             }
         }
+        deferred_cleanup_count_.store(deferred_cleanup_batches_.size(),
+                                      std::memory_order_release);
 
         if (stop_deferred_cleanup_) {
             if (!deferred_cleanup_batches_.empty()) {
