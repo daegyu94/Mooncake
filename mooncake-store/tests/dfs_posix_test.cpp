@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -276,6 +277,69 @@ TEST_F(FsAdapterFdTest, MultiIovPartialReadAndUnalignedAccess) {
     EXPECT_EQ(*beyond_read, 0);
 
     adapter_->CloseFile(*fd);
+}
+
+TEST_F(FsAdapterFdTest, ReadAtStopsAtEndOfFile) {
+    constexpr size_t total = 8192;
+    ASSERT_TRUE(adapter_->PreallocateFile(tmp_->file("shard_eof.data"), total)
+                    .has_value());
+    auto fd = adapter_->OpenFile(tmp_->file("shard_eof.data"));
+    ASSERT_TRUE(fd.has_value());
+
+    char buf[64] = {};
+    iovec iov{buf, sizeof(buf)};
+    auto read = adapter_->ReadAt(*fd, &iov, 1, total - 32);
+    ASSERT_TRUE(read.has_value());
+    EXPECT_EQ(*read, 32);
+
+    adapter_->CloseFile(*fd);
+}
+
+// Reproduces FUSE filesystems (e.g. 3FS) that return a short read for a
+// sparse hole: the kernel then shrinks its cached file size and reads of
+// written data past the hole end early. Needs such a mount, so it only runs
+// when MOONCAKE_TEST_DFS_FUSE_DIR points into one.
+TEST(PosixFsAdapterFuseTest, ReadAtPastHoleOnReopenedFile) {
+    const char* dir = ::getenv("MOONCAKE_TEST_DFS_FUSE_DIR");
+    if (dir == nullptr || *dir == '\0') {
+        GTEST_SKIP() << "MOONCAKE_TEST_DFS_FUSE_DIR is not set";
+    }
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(dir).has_value());
+    const std::string path =
+        std::string(dir) + "/fuse_hole_" + std::to_string(::getpid()) + ".data";
+    ASSERT_TRUE(adapter.PreallocateFile(path, 1ULL << 30).has_value());
+    std::unique_ptr<const std::string, void (*)(const std::string*)> cleanup(
+        &path, [](const std::string* file) { ::unlink(file->c_str()); });
+
+    // Objects separated by holes, as shard allocations leave them.
+    constexpr size_t kObjectSize = 4 << 20;
+    constexpr int64_t kStride = 8 << 20;
+    constexpr int kObjects = 4;
+    auto fd = adapter.OpenFile(path);
+    ASSERT_TRUE(fd.has_value());
+    std::vector<std::string> objects;
+    for (int i = 0; i < kObjects; ++i) {
+        objects.emplace_back(kObjectSize, static_cast<char>('a' + i));
+        iovec iov{objects.back().data(), kObjectSize};
+        ASSERT_EQ(adapter.WriteAt(*fd, &iov, 1, i * kStride), kObjectSize);
+    }
+    ASSERT_TRUE(adapter.CloseFile(*fd).has_value());
+
+    fd = adapter.OpenFile(path);
+    ASSERT_TRUE(fd.has_value());
+    std::string buffer(kObjectSize, '\0');
+    for (int i = 0; i < kObjects; ++i) {
+        iovec iov{buffer.data(), kObjectSize};
+        EXPECT_EQ(adapter.ReadAt(*fd, &iov, 1, i * kStride), kObjectSize)
+            << "object " << i;
+        const auto mismatch =
+            std::mismatch(buffer.begin(), buffer.end(), objects[i].begin());
+        EXPECT_TRUE(mismatch.first == buffer.end())
+            << "object " << i << " differs at byte "
+            << (mismatch.first - buffer.begin());
+    }
+    adapter.CloseFile(*fd);
 }
 
 TEST_F(FsAdapterFdTest, PreallocateLargeSparseFile) {

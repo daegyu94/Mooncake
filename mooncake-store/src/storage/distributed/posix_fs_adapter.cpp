@@ -31,6 +31,21 @@ ErrorCode ReadOpenError() {
                            : ErrorCode::FILE_OPEN_FAIL;
 }
 
+// Whether the filesystem, bypassing the kernel's cached attributes, reports
+// the file as extending past `end`.
+bool FileExtendsPast(int fd, uint64_t end) {
+#if defined(__linux__)
+    struct statx info{};
+    return ::statx(fd, "", AT_EMPTY_PATH | AT_STATX_FORCE_SYNC, STATX_SIZE,
+                   &info) == 0 &&
+           (info.stx_mask & STATX_SIZE) != 0 && info.stx_size > end;
+#else
+    (void)fd;
+    (void)end;
+    return false;
+#endif
+}
+
 }  // namespace
 
 tl::expected<void, ErrorCode> PosixFsAdapter::Init(
@@ -154,11 +169,31 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::ReadAt(int fd, iovec* iov,
     if (!valid) return tl::make_unexpected(valid.error());
     if (iovcnt == 0) return size_t{0};
 
+    size_t requested = 0;
+    for (int i = 0; i < iovcnt; ++i) requested += iov[i].iov_len;
+
     ssize_t ret;
     do {
         ret = ::preadv(fd, iov, iovcnt, static_cast<off_t>(offset));
     } while (ret < 0 && errno == EINTR);
     if (ret < 0) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+
+    // A FUSE filesystem that answers a read over a sparse hole with a short
+    // read (e.g. 3FS) makes the kernel shrink its cached file size, so reads
+    // of written data past the hole end early. Refresh the size from the
+    // filesystem and retry before reporting a short read. Other readers of
+    // the file can shrink the size again, so retry a bounded number of times.
+    constexpr int kMaxStaleSizeRetries = 3;
+    for (int attempt = 0;
+         attempt < kMaxStaleSizeRetries &&
+         static_cast<size_t>(ret) < requested &&
+         FileExtendsPast(fd, static_cast<uint64_t>(offset) + ret);
+         ++attempt) {
+        do {
+            ret = ::preadv(fd, iov, iovcnt, static_cast<off_t>(offset));
+        } while (ret < 0 && errno == EINTR);
+        if (ret < 0) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
     return static_cast<size_t>(ret);
 }
 
