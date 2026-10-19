@@ -339,6 +339,91 @@ TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
     EXPECT_EQ(py_client_->unregister_buffer(second.data()), 0);
 }
 
+TEST_F(RealClientTest, GetIntoRangesReadsDfsObjectOnce) {
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "distributed_storage_backend");
+    ScopedEnvVar local_buffer("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                              "16777216");
+    ScopedEnvVar dfs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar dfs_shards("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar dfs_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+    ScopedEnvVar dfs_alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar dfs_eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar dfs_deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar dfs_single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+    ScopedEnvVar client_metric("MC_STORE_CLIENT_METRIC", "1");
+
+    char path[] = "/tmp/mooncake_ranges_dfs_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+    ScopedEnvVar dfs_root("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+
+    ASSERT_TRUE(master_.Start(
+        InProcMasterConfigBuilder().set_default_kv_lease_ttl(1000).build()));
+    master_address_ = master_.master_address();
+    constexpr char kClientAddress[] = "localhost:17826";
+    ASSERT_EQ(
+        py_client_->setup_real(kClientAddress, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, "tcp", "", master_address_,
+                               nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kObjectSize = 4096;
+    const std::string key = "ranges_dfs";
+    std::string source(kObjectSize, '\0');
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 7) % 251);
+    }
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.dfs_replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, source, config), 0);
+    ASSERT_EQ(py_client_->batch_replica_clear({key}, kClientAddress).size(), 1);
+
+    const auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_dfs_replica());
+    const auto dfs_descriptor = replicas.front().get_dfs_descriptor();
+
+    std::string destination(2048, '\0');
+    ASSERT_EQ(
+        py_client_->register_buffer(destination.data(), destination.size()), 0);
+    auto* metric = py_client_->client_->GetDfsMetricPtr();
+    ASSERT_NE(metric, nullptr);
+    const int64_t base_read_ops = metric->dfs_read_ops.value();
+
+    // Three valid ranges, one that overflows the object, and one that does not
+    // fit the destination. The valid ranges share a single DFS read.
+    const std::vector<std::vector<std::vector<size_t>>> dst_offsets{
+        {{0, 512, 1289, 0, 2000}}};
+    const std::vector<std::vector<std::vector<size_t>>> src_offsets{
+        {{127, 2048, 0, 4000, 0}}};
+    const std::vector<std::vector<std::vector<size_t>>> sizes{
+        {{512, 777, 300, 200, 100}}};
+    auto results = py_client_->get_into_ranges({destination.data()}, {{key}},
+                                               dst_offsets, src_offsets, sizes);
+    EXPECT_EQ(results, (std::vector<std::vector<std::vector<int64_t>>>{
+                           {{512, 777, 300, toInt(ErrorCode::INVALID_PARAMS),
+                             toInt(ErrorCode::INVALID_PARAMS)}}}));
+    EXPECT_EQ(destination.substr(0, 512), source.substr(127, 512));
+    EXPECT_EQ(destination.substr(512, 777), source.substr(2048, 777));
+    EXPECT_EQ(destination.substr(1289, 300), source.substr(0, 300));
+    EXPECT_EQ(metric->dfs_read_ops.value(), base_read_ops + 1);
+
+    std::filesystem::resize_file(dfs_descriptor.file_path,
+                                 dfs_descriptor.offset + kObjectSize / 2);
+    results =
+        py_client_->get_into_ranges({destination.data()}, {{key}}, {{{0, 512}}},
+                                    {{{0, 1024}}}, {{{512, 512}}});
+    EXPECT_EQ(results, (std::vector<std::vector<std::vector<int64_t>>>{
+                           {{toInt(ErrorCode::FILE_READ_FAIL),
+                             toInt(ErrorCode::FILE_READ_FAIL)}}}));
+
+    EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
+}
+
 #ifdef MOONCAKE_TEST_CUDA_H2D
 TEST_F(RealClientTest, LastHitOnlyGpuCheckpointRoundTrip) {
     int device_count = 0;

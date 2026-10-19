@@ -5116,6 +5116,50 @@ RealClient::get_into_ranges_internal(
                 continue;
             }
 
+            // A DFS replica can only be read as a whole object, so read it
+            // once for all ranges of this key instead of once per range.
+            std::optional<BufferHandle> dfs_object;
+            std::optional<ErrorCode> dfs_error;
+            auto read_dfs_range =
+                [&](size_t k) -> tl::expected<int64_t, ErrorCode> {
+                if (!dfs_object && !dfs_error) {
+                    auto object =
+                        client_buffer_allocator_->allocate(metadata.total_size);
+                    if (!object) {
+                        LOG(ERROR) << "Failed to allocate temp buffer for "
+                                   << "DFS ranged read, key: " << keys[j]
+                                   << ", size: " << metadata.total_size;
+                        dfs_error = ErrorCode::NO_AVAILABLE_HANDLE;
+                    } else {
+                        std::vector<Slice> slices;
+                        allocateSlices(slices, metadata.replica, object->ptr());
+                        auto get_result = client_->Get(
+                            keys[j],
+                            FilterQueryResult(metadata.query_result,
+                                              metadata.replica, false),
+                            slices);
+                        if (!get_result) {
+                            LOG(ERROR) << "DFS Get failed for key: " << keys[j]
+                                       << " with error: "
+                                       << toString(get_result.error());
+                            dfs_error = get_result.error();
+                        } else {
+                            dfs_object = std::move(object);
+                        }
+                    }
+                }
+                if (dfs_error) return tl::unexpected(*dfs_error);
+                if (auto r = scatter_host_to_maybe_device(
+                        static_cast<char *>(buffers[i]) + dst_offsets[k],
+                        static_cast<const char *>(dfs_object->ptr()) +
+                            src_offsets[k],
+                        sizes[k], "DFS ranged read, key: " + keys[j]);
+                    !r) {
+                    return tl::unexpected(r.error());
+                }
+                return static_cast<int64_t>(sizes[k]);
+            };
+
             for (size_t k = 0; k < range_results.size(); ++k) {
                 const size_t dst_offset = dst_offsets[k];
                 if (dst_offset > capacities[i] ||
@@ -5123,9 +5167,16 @@ RealClient::get_into_ranges_internal(
                     continue;
                 }
 
-                range_results[k] = execute_ranged_read(
-                    keys[j], buffers[i], dst_offset, src_offsets[k], sizes[k],
-                    metadata, false, false);
+                if (metadata.replica.is_dfs_replica() &&
+                    !is_object_range_overflow(
+                        src_offsets[k], sizes[k],
+                        static_cast<size_t>(metadata.total_size))) {
+                    range_results[k] = read_dfs_range(k);
+                } else {
+                    range_results[k] = execute_ranged_read(
+                        keys[j], buffers[i], dst_offset, src_offsets[k],
+                        sizes[k], metadata, false, false);
+                }
                 if (!allow_query_refresh && range_results[k] &&
                     metadata.query_result.IsLeaseExpired()) {
                     range_results[k] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
