@@ -4661,9 +4661,15 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             return static_cast<int64_t>(total_size);
         }
 
-        if (replica.is_disk_replica() || replica.is_dfs_replica()) {
+        auto runtime_accelerator =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
+        void *dst = static_cast<char *>(buffer) + dst_offset;
+        if (replica.is_disk_replica() ||
+            (replica.is_dfs_replica() &&
+             runtime_accelerator.FindDeviceForPointer(dst))) {
             // File-backed full read: use a contiguous temp buffer, then
-            // scatter to the requested destination.
+            // scatter to the requested destination. DFS reads into host
+            // destinations take the direct path below.
             const char *replica_type =
                 replica.is_dfs_replica() ? "DFS" : "DISK";
             auto alloc_result = client_buffer_allocator_->allocate(total_size);
@@ -4684,7 +4690,6 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                            << " with error: " << toString(get_result.error());
                 return tl::unexpected(get_result.error());
             }
-            void *dst = static_cast<char *>(buffer) + dst_offset;
             const void *src = tmp_handle.ptr();
             if (auto r = scatter_host_to_maybe_device(
                     dst, src, total_size,
@@ -4695,9 +4700,6 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             return static_cast<int64_t>(total_size);
         }
 
-        auto runtime_accelerator =
-            device::GetAcceleratorRegistry().RuntimeAccelerators();
-        void *dst = static_cast<char *>(buffer) + dst_offset;
         if (runtime_accelerator.FindDeviceForPointer(dst) &&
             ((!client_->CanUseLocalMemcpy(replica) &&
               !can_use_direct_memory_read(replica, dst, total_size)) ||
@@ -6452,9 +6454,14 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        if (replica.is_disk_replica() || replica.is_dfs_replica()) {
-            // File-backed replicas cannot safely read directly into arbitrary
-            // user buffers. Use a contiguous temp buffer, then scatter.
+        if (replica.is_disk_replica() ||
+            (replica.is_dfs_replica() &&
+             device::GetAcceleratorRegistry()
+                 .RuntimeAccelerators()
+                 .FindDeviceForPointer(buffers[i]))) {
+            // DISK replicas, and DFS replicas bound for device memory, cannot
+            // read directly into the user buffer. Use a contiguous host temp
+            // buffer, then scatter.
             disk_operations.emplace_back(
                 DiskKeyInfo{.key = key,
                             .original_index = i,
@@ -6465,7 +6472,8 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        // MEMORY / NOF: RDMA directly to user buffer.
+        // MEMORY / NOF: RDMA directly to user buffer. DFS: the filesystem
+        // reads directly into the host user buffer.
         std::vector<Slice> key_slices;
         allocateSlices(key_slices, replica, buffers[i]);
         valid_operations.push_back(

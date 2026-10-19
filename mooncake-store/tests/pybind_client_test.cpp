@@ -339,6 +339,81 @@ TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
     EXPECT_EQ(py_client_->unregister_buffer(second.data()), 0);
 }
 
+TEST_F(RealClientTest, DfsReadsIntoHostBuffersWithoutTempBuffer) {
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "distributed_storage_backend");
+    ScopedEnvVar dfs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar dfs_shards("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar dfs_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+    ScopedEnvVar dfs_alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar dfs_eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar dfs_deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar dfs_single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    char path[] = "/tmp/mooncake_direct_dfs_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+    ScopedEnvVar dfs_root("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    constexpr char kClientAddress[] = "localhost:17825";
+    ASSERT_EQ(
+        py_client_->setup_real(kClientAddress, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, "tcp", "", master_address_,
+                               nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kObjectSize = 4096;
+    const std::string key = "direct_dfs";
+    std::string source(kObjectSize, '\0');
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 7) % 251);
+    }
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.dfs_replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, source, config), 0);
+    ASSERT_EQ(py_client_->batch_replica_clear({key}, kClientAddress).size(), 1);
+    const auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_dfs_replica());
+
+    // Exhaust the client buffer so a temp-buffer read would fail with
+    // NO_AVAILABLE_HANDLE.
+    std::vector<BufferHandle> held;
+    while (auto handle =
+               py_client_->client_buffer_allocator_->allocate(kObjectSize)) {
+        held.push_back(std::move(*handle));
+    }
+    ASSERT_FALSE(held.empty());
+
+    std::string first(kObjectSize, '\0');
+    std::string second(kObjectSize, '\0');
+    EXPECT_EQ(
+        py_client_->batch_get_into({key, key}, {first.data(), second.data()},
+                                   {first.size(), second.size()}),
+        std::vector<int64_t>(2, kObjectSize));
+    EXPECT_EQ(first, source);
+    EXPECT_EQ(second, source);
+
+    std::string single(kObjectSize, '\0');
+    EXPECT_EQ(py_client_->get_into(key, single.data(), single.size()),
+              static_cast<int64_t>(kObjectSize));
+    EXPECT_EQ(single, source);
+
+    // A short DFS read still fails on the direct path.
+    const auto dfs_descriptor = replicas.front().get_dfs_descriptor();
+    std::filesystem::resize_file(dfs_descriptor.file_path,
+                                 dfs_descriptor.offset + kObjectSize / 2);
+    EXPECT_EQ(py_client_->batch_get_into({key}, {first.data()}, {first.size()}),
+              std::vector<int64_t>{toInt(ErrorCode::FILE_READ_FAIL)});
+    EXPECT_EQ(py_client_->get_into(key, single.data(), single.size()),
+              toInt(ErrorCode::FILE_READ_FAIL));
+}
+
 #ifdef MOONCAKE_TEST_CUDA_H2D
 TEST_F(RealClientTest, LastHitOnlyGpuCheckpointRoundTrip) {
     int device_count = 0;
