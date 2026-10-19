@@ -143,10 +143,18 @@ class WorkerPoolTestPeer {
                            const std::string &peer_nic_path,
                            Transport::Slice *slice) {
         pool.collective_slice_queue_[thread_id][peer_nic_path].push_back(slice);
+        pool.collective_slice_queue_pending_[thread_id] = 1;
     }
 
     static void performPostSend(WorkerPool &pool, int thread_id) {
         pool.performPostSend(thread_id);
+    }
+
+    static size_t queuedSliceCount(const WorkerPool &pool, int thread_id) {
+        size_t count = 0;
+        for (const auto &entry : pool.collective_slice_queue_[thread_id])
+            count += entry.second.size();
+        return count;
     }
 
     static void clearQueuedSlices(WorkerPool &pool) {
@@ -560,6 +568,43 @@ TEST(RdmaEndpointLifecycleGateTest,
 
     WorkerPoolTestPeer::clearQueuedSlices(*peer_a.worker_pool);
     WorkerPoolTestPeer::clearQueuedSlices(*peer_b.worker_pool);
+}
+
+TEST(RdmaEndpointLifecycleGateTest,
+     QueuedSliceIsRecheckedUntilEndpointIsReady) {
+    auto barrier = std::make_shared<InProcessRdmaTransport::Barrier>();
+    FakeRdmaPeer peer;
+    ASSERT_NO_FATAL_FAILURE(
+        initFakePeer(peer, "rdma-wait-a:10000", "mlx5_wait_a", barrier));
+
+    const std::string peer_nic_path =
+        MakeNicPath("rdma-wait-b:10000", "mlx5_wait_b");
+    ASSERT_NO_FATAL_FAILURE(installZeroQpEndpoint(peer, peer_nic_path));
+    auto endpoint = peer.context->endpoint(peer_nic_path);
+    ASSERT_NE(endpoint, nullptr);
+    RdmaEndPointTestPeer::setStatus(*endpoint,
+                                    RdmaEndPoint::CONNECTED_WAIT_READY_ACK);
+    RdmaEndPointTestPeer::setReadyWaitStartTs(*endpoint,
+                                              getCurrentTimeInNano());
+
+    Transport::Slice slice;
+    Transport::TransferTask task;
+    queueHandshakeSlice(peer, peer_nic_path, slice, task);
+    slice.rdma.max_retry_cnt = 1;
+
+    // The endpoint is not ready yet, so the slice stays queued.
+    WorkerPoolTestPeer::performPostSend(*peer.worker_pool, 0);
+    EXPECT_EQ(WorkerPoolTestPeer::queuedSliceCount(*peer.worker_pool, 0), 1u);
+    EXPECT_EQ(task.failed_slice_count, 0u);
+
+    // A later pass must still visit the queued slice: once the ready ACK
+    // times out, the slice fails instead of waiting forever.
+    RdmaEndPointTestPeer::setReadyWaitStartTs(*endpoint, 1);
+    WorkerPoolTestPeer::performPostSend(*peer.worker_pool, 0);
+    EXPECT_EQ(WorkerPoolTestPeer::queuedSliceCount(*peer.worker_pool, 0), 0u);
+    EXPECT_EQ(task.failed_slice_count, 1u);
+
+    WorkerPoolTestPeer::clearQueuedSlices(*peer.worker_pool);
 }
 
 TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {

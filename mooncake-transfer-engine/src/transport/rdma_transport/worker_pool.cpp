@@ -236,6 +236,7 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
       submitted_slice_count_(0),
       processed_slice_count_(0) {
     collective_slice_queue_.resize(worker_count_);
+    collective_slice_queue_pending_.assign(worker_count_, 0);
     for (int i = 0; i < worker_count_; ++i)
         worker_thread_.emplace_back(
             std::thread(std::bind(&WorkerPool::transferWorker, this, i)));
@@ -586,6 +587,7 @@ void WorkerPool::performPostSend(int thread_id) {
             auto &local_entry = local_slice_queue[entry.first];
             local_entry.insert(local_entry.end(), entry.second.begin(),
                                entry.second.end());
+            collective_slice_queue_pending_[thread_id] = 1;
         }
         worker_slice_queue_[thread_id].clear();
     }
@@ -614,6 +616,10 @@ void WorkerPool::performPostSend(int thread_id) {
             redispatch(entry.second, thread_id, handoff_to_local_worker);
         return;
     }
+
+    // Workers call this on every loop iteration while any slice is in flight,
+    // so skip the per-peer scan when nothing is queued.
+    if (!collective_slice_queue_pending_[thread_id]) return;
 
 #ifdef CONFIG_CACHE_ENDPOINT
     thread_local uint64_t tl_last_cache_ts = getCurrentTimeInNano();
@@ -751,6 +757,12 @@ void WorkerPool::performPostSend(int thread_id) {
         if (!endpoint->active()) context_.deleteEndpointByPtr(endpoint.get());
 #endif
     }
+    // Write only on change: the workers' flags share a cache line.
+    const uint8_t pending =
+        std::any_of(local_slice_queue.begin(), local_slice_queue.end(),
+                    [](const auto &entry) { return !entry.second.empty(); });
+    if (collective_slice_queue_pending_[thread_id] != pending)
+        collective_slice_queue_pending_[thread_id] = pending;
 
     if (!failed_slice_list.empty()) {
         SliceList retry_list;
@@ -1117,6 +1129,7 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             if (owner_thread == thread_id && !defer_local_redispatch) {
                 collective_slice_queue_[thread_id][*peer_nic_path].push_back(
                     slice);
+                collective_slice_queue_pending_[thread_id] = 1;
             } else {
                 enqueueSliceToOwner(slice);
                 shared_redispatch_count++;

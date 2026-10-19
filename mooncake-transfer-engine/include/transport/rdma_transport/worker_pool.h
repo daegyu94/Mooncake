@@ -148,6 +148,11 @@ class WorkerPool {
 
     std::vector<std::unordered_map<std::string, SliceList>>
         collective_slice_queue_;
+    // Per worker: whether collective_slice_queue_ may hold slices. Its map
+    // keeps an entry for every peer path the worker has used, so this lets an
+    // idle worker skip scanning them. Accessed only by the owning worker
+    // thread.
+    std::vector<uint8_t> collective_slice_queue_pending_;
     std::vector<std::unordered_map<std::string, SliceList>> worker_slice_queue_;
     std::vector<std::mutex> worker_slice_queue_lock_;
 
